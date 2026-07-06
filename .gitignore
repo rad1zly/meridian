@@ -27,6 +27,13 @@ decision-log.json
 hivemind-cache.json
 signal-weights.json
 
+# Sanitized versions — safe to push (secrets redacted, addresses pseudonymized).
+# These mirror the production files above so anyone can see real config structure
+# without exposing wallet keys or trade-specific data.
+!user-config.sanitized.json
+!state.sanitized.json
+!lessons.sanitized.json
+
 # Logs
 logs/
 
