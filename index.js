@@ -31,6 +31,7 @@ import { getActiveStrategy } from "./strategy-library.js";
 import { recordPositionSnapshot, recallForPool, addPoolNote } from "./pool-memory.js";
 import { checkSmartWalletsOnPool } from "./smart-wallets.js";
 import { getTokenNarrative, getTokenInfo } from "./tools/token.js";
+import { getCachedExitSignal, refreshExitSignal } from "./tools/chart-indicators.js";
 import { stageSignals } from "./signal-tracker.js";
 import { getWeightsSummary } from "./signal-weights.js";
 import { bootstrapHiveMind, ensureAgentId, getHiveMindPullMode, isHiveMindEnabled, pullHiveMindLessons, pullHiveMindPresets, registerHiveMindAgent, startHiveMindBackgroundSync } from "./hivemind.js";
@@ -920,6 +921,13 @@ Summarize the current portfolio health, total fees earned, and performance of al
       for (const p of result.positions) {
         confirmPeak(p.position, p.pnl_pct, confirmTicks);
 
+        // Keep the exit-signal cache warm for profitable in-range positions (Rule 6
+        // in getDeterministicCloseRule reads it synchronously). refreshExitSignal is
+        // TTL-gated internally, so calling it every tick is a no-op once cached.
+        if (config.indicators.enabled && p.in_range && p.pnl_pct != null && p.pnl_pct > 0 && p.base_mint) {
+          refreshExitSignal(p.base_mint).catch(() => {});
+        }
+
         // Detect an exit signal this tick (rule-based exits, then deterministic close rules).
         const exit = updatePnlAndCheckExits(p.position, p, config.management);
         const closeRule = exit ? null : getDeterministicCloseRule(p, config.management);
@@ -1132,6 +1140,22 @@ function getDeterministicCloseRule(position, managementConfig) {
     (position.age_minutes ?? 0) >= 60
   ) {
     return { action: "CLOSE", rule: 5, reason: "low yield" };
+  }
+  // Rule 6 — indicator-confirmed reversal while profitable. Trailing TP only reacts
+  // after price has already dropped off peak (plus poll/confirm latency); this locks
+  // in gains as soon as exitPreset (bb_plus_rsi-style: upper band + RSI overbought)
+  // confirms a reversal, instead of waiting for the peak-drop to be big enough to notice.
+  if (
+    config.indicators.enabled &&
+    !pnlSuspect &&
+    position.in_range &&
+    position.pnl_pct != null &&
+    position.pnl_pct > 0
+  ) {
+    const exitSignal = getCachedExitSignal(position.base_mint);
+    if (exitSignal?.confirmed) {
+      return { action: "CLOSE", rule: 6, reason: `indicator exit: ${exitSignal.reason}` };
+    }
   }
   return null;
 }

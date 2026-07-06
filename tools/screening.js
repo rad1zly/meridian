@@ -825,9 +825,17 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     const confirmations = await Promise.all(
       eligible.map(async (pool) => {
         try {
+          // This bot deploys single-sided SOL in bins_below only (POV from above —
+          // it only earns fees when price sweeps DOWN into the range). Evaluating
+          // entryPreset on the bullish "entry" branch was backwards: it confirmed
+          // breakouts/oversold-bounces (price about to go UP and away from the
+          // range), which is exactly the setup that produces a no-fee OOR-above
+          // close. Pass side: "exit" to evaluate the bearish/breakdown branch of
+          // the same configured preset instead.
           const confirmation = await confirmIndicatorPreset({
             mint: pool.base?.mint,
-            side: "entry",
+            side: "exit",
+            preset: config.indicators.entryPreset,
           });
           return { pool: pool.pool, confirmation };
         } catch (error) {

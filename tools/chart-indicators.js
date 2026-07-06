@@ -224,6 +224,41 @@ async function fetchChartIndicatorsForMint(
   });
 }
 
+// ── Exit-signal cache ──────────────────────────────────────────────────
+// The management PnL poller runs every few seconds (config.pnl.pollIntervalSec),
+// far faster than the 15m/5m candles these presets are based on. Hitting the
+// indicator API on every tick would hammer it for no new information, so exit
+// confirmation is cached per mint and refreshed in the background on a TTL.
+const EXIT_SIGNAL_TTL_MS = 90 * 1000;
+const exitSignalCache = new Map(); // mint -> { ts, confirmed, reason }
+const exitSignalInflight = new Set();
+
+export function getCachedExitSignal(mint) {
+  if (!mint) return null;
+  const entry = exitSignalCache.get(mint);
+  if (!entry || Date.now() - entry.ts > EXIT_SIGNAL_TTL_MS) return null;
+  return entry;
+}
+
+export async function refreshExitSignal(mint) {
+  if (!mint || !config.indicators.enabled) return null;
+  const cached = exitSignalCache.get(mint);
+  if (cached && Date.now() - cached.ts < EXIT_SIGNAL_TTL_MS) return cached;
+  if (exitSignalInflight.has(mint)) return cached ?? null;
+  exitSignalInflight.add(mint);
+  try {
+    const result = await confirmIndicatorPreset({ mint, side: "exit" });
+    const entry = { ts: Date.now(), confirmed: !!result.confirmed, reason: result.reason };
+    exitSignalCache.set(mint, entry);
+    return entry;
+  } catch (error) {
+    log("indicators_warn", `Exit signal refresh failed for ${mint.slice(0, 8)}: ${error.message}`);
+    return cached ?? null;
+  } finally {
+    exitSignalInflight.delete(mint);
+  }
+}
+
 export async function confirmIndicatorPreset({
   mint,
   side,
