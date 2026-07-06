@@ -210,6 +210,10 @@ function buildPosition(f, prices, solUsd, meteora, solMode) {
     : null;
   const ageMinutes = meteora?.createdAt ? Math.floor((Date.now() - meteora.createdAt * 1000) / 60000) : ageFromState;
 
+  // Mcap range: REMOVED 2026-07-01 per user — bikin /positions terlalu penuh.
+  // const tracked = getTrackedPosition(f.position);
+  // ... see git history for mcap_range calculation if needed.
+
   return {
     position:           f.position,
     pool:               f.pool,

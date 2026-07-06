@@ -15,17 +15,21 @@ import { config, computeDeployAmount, MIN_SAFE_BINS_BELOW } from "../config.js";
 import { log } from "../logger.js";
 import {
   trackPosition,
+  setPositionStrategy,
   markOutOfRange,
   markInRange,
   recordClaim,
   recordClose,
+  recordAddLiquidity,
+  downgradeHybridToSpot,
   getTrackedPosition,
   minutesOutOfRange,
   syncOpenPositions,
+  deleteGhostPositionsForPool,
 } from "../state.js";
 import { recordPerformance } from "../lessons.js";
 import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
-import { normalizeMint } from "./wallet.js";
+import { getWalletBalances, normalizeMint } from "./wallet.js";
 import { appendDecision } from "../decision-log.js";
 import { agentMeridianJson, getAgentIdForRequests, getAgentMeridianHeaders } from "./agent-meridian.js";
 import { getAndClearStagedSignals } from "../signal-tracker.js";
@@ -449,6 +453,28 @@ export async function getActiveBin({ pool_address }) {
 }
 
 // ─── Deploy Position ───────────────────────────────────────────
+
+/**
+ * Anchor error 0x178b on the Meteora DLMM program corresponds to a bin-array
+ * initialization failure: the requested range crosses a bin-array boundary
+ * whose PDA has not been initialized on this pool yet. Surface area is the
+ * error message thrown by @meteora-ag/dlmm (string contains either the raw
+ * hex code or the symbol name). We match defensively because the exact wording
+ * differs between SDK releases.
+ */
+const INVALID_BIN_ARRAY_HEX = "0x178b";
+function isInvalidBinArrayError(error) {
+  if (!error) return false;
+  const msg = String(error?.message ?? error?.toString?.() ?? "").toLowerCase();
+  if (!msg) return false;
+  return (
+    msg.includes(INVALID_BIN_ARRAY_HEX) ||
+    msg.includes("invalidbinarray") ||
+    msg.includes("bin array index is invalid") ||
+    msg.includes("invalid bin array")
+  );
+}
+
 export async function deployPosition({
   pool_address,
   amount_sol, // legacy: will be used as amount_y if amount_y is not provided
@@ -472,6 +498,9 @@ export async function deployPosition({
   entry_tvl,
   entry_volume,
   entry_holders,
+  // hybrid pool grouping — set by deployHybridPool, ignored by single deploys
+  hybrid_group_id = null,
+  hybrid_role = null,
 }) {
   pool_address = normalizeMint(pool_address);
   const activeStrategy = strategy || config.strategy.strategy;
@@ -693,10 +722,12 @@ export async function deployPosition({
         const signalSnapshot = config.darwin?.enabled
           ? getAndClearStagedSignals(pool_address, baseMint)
           : null;
+        // Fallback for pool_name — relay path sometimes drops it. Avoid `?/SOL` ghost display.
+        const safePoolName = pool_name || (matching?.pair?.includes("/") ? matching.pair : `pool-${pool_address.slice(0, 8)}`);
         trackPosition({
           position: positionAddress,
           pool: pool_address,
-          pool_name,
+          pool_name: safePoolName,
           strategy: activeStrategy,
           bin_range: { min: minBinId, max: maxBinId, bins_below: activeBinsBelow, bins_above: activeBinsAbove },
           bin_step,
@@ -712,6 +743,8 @@ export async function deployPosition({
           entry_tvl,
           entry_volume,
           entry_holders,
+          hybrid_group_id,
+          hybrid_role,
         });
       }
 
@@ -767,142 +800,400 @@ export async function deployPosition({
     }
   }
 
+  // ── Direct + Wide Path (with InvalidBinArray ghost cleanup) ─────────────
+// On 0x178b the deploy TX fails before any state gets tracked — but as a
+// defensive measure we still scrub any ghost entry for the pool between
+// attempts (the retry then runs against the SAME bins_below the caller
+// asked for; we never widen or shrink the range automatically because
+// that would silently override the SCREENER's coverage decision).
   const wallet = getWallet();
-  const newPosition = Keypair.generate();
+  const baseSignalSnapshot = config.darwin?.enabled
+    ? getAndClearStagedSignals(pool_address, baseMint)
+    : null;
 
-  log("deploy", `Pool: ${pool_address}`);
-  log("deploy", `Strategy: ${activeStrategy}, Bins: ${minBinId} to ${maxBinId} (${totalBins} bins${isWideRange ? " — WIDE RANGE" : ""})`);
-  log("deploy", `Amount: ${finalAmountX} X, ${finalAmountY} Y`);
-  log("deploy", `Position: ${newPosition.publicKey.toString()}`);
+  const maxAttempts = 3;
+  let attempt = 0;
+  let lastResult = null;
 
-  try {
-    const txHashes = [];
+  while (attempt < maxAttempts) {
+    attempt += 1;
+    const newPosition = Keypair.generate();
+    // Bin math is constant across attempts — caller-supplied range is final.
+    const aBinsBelow = activeBinsBelow;
+    const aBinsAbove = activeBinsAbove;
+    const aTotalBins = aBinsBelow + aBinsAbove;
+    const aIsWide = aTotalBins > 69;
+    const aMinBinId = activeBin.binId - aBinsBelow;
+    const aMaxBinId = isSingleSidedSol ? activeBin.binId : activeBin.binId + aBinsAbove;
+    const aMinPrice = Number(getPriceOfBinByBinId(aMinBinId, actualBinStep).toString());
+    const aMaxPrice = Number(getPriceOfBinByBinId(aMaxBinId, actualBinStep).toString());
+    const aDownPct = activePrice > 0 ? ((activePrice - aMinPrice) / activePrice) * 100 : null;
+    const aUpPct = activePrice > 0 ? ((aMaxPrice - activePrice) / activePrice) * 100 : null;
+    const aWidthPct = aMinPrice > 0 ? ((aMaxPrice - aMinPrice) / aMinPrice) * 100 : null;
 
-    if (isWideRange) {
-      // ── Wide Range Path (>69 bins) ─────────────────────────────────
-      // Solana limits inner instruction realloc to 10240 bytes, so we can't create
-      // a large position in a single initializePosition ix.
-      // Solution: createExtendedEmptyPosition (returns Transaction | Transaction[]),
-      //           then addLiquidityByStrategyChunkable (returns Transaction[]).
+    log(
+      "deploy",
+      `Pool: ${pool_address}` +
+        (attempt > 1 ? ` [retry ${attempt}/${maxAttempts}]` : ""),
+    );
+    log(
+      "deploy",
+      `Strategy: ${activeStrategy}, Bins: ${aMinBinId} to ${aMaxBinId} (${aTotalBins} bins${aIsWide ? " — WIDE RANGE" : ""})`,
+    );
+    log("deploy", `Amount: ${finalAmountX} X, ${finalAmountY} Y`);
+    log("deploy", `Position: ${newPosition.publicKey.toString()}`);
 
-      // Phase 1: Create empty position (may be multiple txs)
-      const createTxs = await pool.createExtendedEmptyPosition(
-        minBinId,
-        maxBinId,
-        newPosition.publicKey,
-        wallet.publicKey,
-      );
-      const createTxArray = Array.isArray(createTxs) ? createTxs : [createTxs];
-      for (let i = 0; i < createTxArray.length; i++) {
-        const signers = i === 0 ? [wallet, newPosition] : [wallet];
-        const txHash = await sendAndConfirmTransaction(getConnection(), createTxArray[i], signers);
-        txHashes.push(txHash);
-        log("deploy", `Create tx ${i + 1}/${createTxArray.length}: ${txHash}`);
+    // Defensive: scrub any ghost entry for this pool before each attempt.
+    // (trackPosition only runs on success, so this is normally a no-op, but
+    // it guarantees the retry never double-counts a state slot.)
+    deleteGhostPositionsForPool(pool_address, { openOnly: true });
+
+    try {
+      await assertRangeDoesNotRequireBinArrayInitialization(pool, aMinBinId, aMaxBinId);
+    } catch (err) {
+      lastResult = { success: false, error: err.message };
+      log("deploy_error", `Range precheck failed: ${err.message}`);
+      if (attempt < maxAttempts && isInvalidBinArrayError(err)) {
+        log(
+          "deploy_retry",
+          `InvalidBinArray on attempt ${attempt} (${err.message}). Retrying with same bins_below=${aBinsBelow}.`,
+        );
+        continue;
       }
-
-      // Phase 2: Add liquidity (may be multiple txs)
-      const addTxs = await pool.addLiquidityByStrategyChunkable({
-        positionPubKey: newPosition.publicKey,
-        user: wallet.publicKey,
-        totalXAmount: totalXLamports,
-        totalYAmount: totalYLamports,
-        strategy: { minBinId, maxBinId, strategyType },
-        slippage: 10, // 10%
-      });
-      const addTxArray = Array.isArray(addTxs) ? addTxs : [addTxs];
-      for (let i = 0; i < addTxArray.length; i++) {
-        const txHash = await sendAndConfirmTransaction(getConnection(), addTxArray[i], [wallet]);
-        txHashes.push(txHash);
-        log("deploy", `Add liquidity tx ${i + 1}/${addTxArray.length}: ${txHash}`);
-      }
-    } else {
-      // ── Standard Path (≤69 bins) ─────────────────────────────────
-      const tx = await pool.initializePositionAndAddLiquidityByStrategy({
-        positionPubKey: newPosition.publicKey,
-        user: wallet.publicKey,
-        totalXAmount: totalXLamports,
-        totalYAmount: totalYLamports,
-        strategy: { maxBinId, minBinId, strategyType },
-        slippage: 1000, // 10% in bps
-      });
-      const txHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet, newPosition]);
-      txHashes.push(txHash);
+      return lastResult;
     }
 
-    log("deploy", `SUCCESS — ${txHashes.length} tx(s): ${txHashes[0]}`);
+    try {
+      const txHashes = [];
+
+      if (aIsWide) {
+        const createTxs = await pool.createExtendedEmptyPosition(
+          aMinBinId,
+          aMaxBinId,
+          newPosition.publicKey,
+          wallet.publicKey,
+        );
+        const createTxArray = Array.isArray(createTxs) ? createTxs : [createTxs];
+        for (let i = 0; i < createTxArray.length; i++) {
+          const signers = i === 0 ? [wallet, newPosition] : [wallet];
+          const txHash = await sendAndConfirmTransaction(getConnection(), createTxArray[i], signers);
+          txHashes.push(txHash);
+          log("deploy", `Create tx ${i + 1}/${createTxArray.length}: ${txHash}`);
+        }
+        const addTxs = await pool.addLiquidityByStrategyChunkable({
+          positionPubKey: newPosition.publicKey,
+          user: wallet.publicKey,
+          totalXAmount: totalXLamports,
+          totalYAmount: totalYLamports,
+          strategy: { minBinId: aMinBinId, maxBinId: aMaxBinId, strategyType },
+          slippage: 10,
+        });
+        const addTxArray = Array.isArray(addTxs) ? addTxs : [addTxs];
+        for (let i = 0; i < addTxArray.length; i++) {
+          const txHash = await sendAndConfirmTransaction(getConnection(), addTxArray[i], [wallet]);
+          txHashes.push(txHash);
+          log("deploy", `Add liquidity tx ${i + 1}/${addTxArray.length}: ${txHash}`);
+        }
+      } else {
+        const tx = await pool.initializePositionAndAddLiquidityByStrategy({
+          positionPubKey: newPosition.publicKey,
+          user: wallet.publicKey,
+          totalXAmount: totalXLamports,
+          totalYAmount: totalYLamports,
+          strategy: { maxBinId: aMaxBinId, minBinId: aMinBinId, strategyType },
+          slippage: 1000,
+        });
+        const txHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet, newPosition]);
+        txHashes.push(txHash);
+      }
+
+      log("deploy", `SUCCESS — ${txHashes.length} tx(s): ${txHashes[0]}`);
+
+      _positionsCacheAt = 0;
+      // Fallback for pool_name — avoid `?/SOL` ghost when caller drops it.
+      const safePoolName = pool_name || `pool-${pool_address.slice(0, 8)}`;
+      trackPosition({
+        position: newPosition.publicKey.toString(),
+        pool: pool_address,
+        pool_name: safePoolName,
+        strategy: activeStrategy,
+        bin_range: { min: aMinBinId, max: aMaxBinId, bins_below: aBinsBelow, bins_above: aBinsAbove },
+        bin_step,
+        volatility: normalizedVolatility,
+        fee_tvl_ratio,
+        organic_score,
+        amount_sol: finalAmountY,
+        amount_x: finalAmountX,
+        active_bin: activeBin.binId,
+        initial_value_usd,
+        signal_snapshot: baseSignalSnapshot,
+        entry_mcap,
+        entry_tvl,
+        entry_volume,
+        entry_holders,
+        hybrid_group_id,
+        hybrid_role,
+      });
+
+      appendDecision({
+        type: "deploy",
+        actor: "SCREENER",
+        pool: pool_address,
+        pool_name,
+        position: newPosition.publicKey.toString(),
+        summary: `Deployed ${finalAmountY} SOL with ${activeStrategy}` + (attempt > 1 ? ` (retry ${attempt} after InvalidBinArray ghost cleanup)` : ""),
+        reason: `Chosen range ${aMinBinId}→${aMaxBinId} around active bin ${activeBin.binId}`,
+        risks: [
+          normalizedVolatility != null ? `volatility ${normalizedVolatility}` : null,
+          fee_tvl_ratio != null ? `fee/TVL ${fee_tvl_ratio}%` : null,
+        ].filter(Boolean),
+        metrics: {
+          amount_sol: finalAmountY,
+          strategy: activeStrategy,
+          active_bin: activeBin.binId,
+          min_bin: aMinBinId,
+          max_bin: aMaxBinId,
+          downside_pct: downside_pct ?? aDownPct,
+          upside_pct: upside_pct ?? aUpPct,
+        },
+      });
+
+      return {
+        success: true,
+        position: newPosition.publicKey.toString(),
+        pool: pool_address,
+        pool_name,
+        bin_range: { min: aMinBinId, max: aMaxBinId, active: activeBin.binId },
+        price_range: { min: aMinPrice, max: aMaxPrice },
+        range_coverage: {
+          downside_pct: aDownPct,
+          upside_pct: aUpPct,
+          width_pct: aWidthPct,
+          active_price: activePrice,
+        },
+        bin_step: actualBinStep,
+        base_fee: actualBaseFee,
+        strategy: activeStrategy,
+        wide_range: aIsWide,
+        amount_x: finalAmountX,
+        amount_y: finalAmountY,
+        txs: txHashes,
+        retry_attempt: attempt,
+      };
+    } catch (error) {
+      lastResult = { success: false, error: error.message };
+      log("deploy_error", `Attempt ${attempt}: ${error.message}`);
+
+      if (attempt < maxAttempts && isInvalidBinArrayError(error)) {
+        log(
+          "deploy_retry",
+          `InvalidBinArray on attempt ${attempt} (${error.message}). Retrying with same bins_below=${aBinsBelow}.`,
+        );
+        continue;
+      }
+
+      return lastResult;
+    }
+  }
+
+  return lastResult ?? { success: false, error: "Deploy retry exhausted" };
+}
+
+// ─── Hybrid Pool Deploy (2026-07-04 refactor) ──────────────────
+// Per user spec: 1 NFT per pool, single-side SOL with same coverage bins_below for both
+// strategies. Two phases into the SAME position:
+//   - Phase 1 (deploy): open position with Spot strategy × 35% amount (initial liquidity)
+//   - Phase 2 (add liq): addLiquidity with BidAsk strategy × 65% amount (additional liquidity)
+// Both phases share the same bin range (single-side SOL below active bin).
+// Position count slot semantics: 1 pool = 1 slot = 1 NFT.
+// Lifecycle: synchronous — close together when criteria hit.
+// Rent savings vs 2-NFT hybrid: ~50% (1 position account, 1 set of bin arrays).
+export async function deployHybridPool({
+  pool_address,
+  amount_sol,           // total SOL to deploy (split 30/70 internally)
+  amount_y,             // alias for amount_sol
+  bins_below,           // coverage-derived range (single-side: only bins_below)
+  bins_above = 0,       // always 0 (single-side SOL)
+  downside_pct,
+  upside_pct,
+  spot_ratio,           // override default 0.3 from config
+  // pool metadata for learning
+  pool_name,
+  bin_step,
+  base_fee,
+  volatility,
+  fee_tvl_ratio,
+  organic_score,
+  initial_value_usd,
+  entry_mcap,
+  entry_tvl,
+  entry_volume,
+  entry_holders,
+}) {
+  pool_address = normalizeMint(pool_address);
+
+  // Compute split
+  const ratio = spot_ratio != null
+    ? Math.max(0.05, Math.min(0.95, Number(spot_ratio)))
+    : Math.max(0.05, Math.min(0.95, Number(config.strategy.hybridSpotRatio ?? 0.35)));
+  const totalSol = Number(amount_y ?? amount_sol ?? 0);
+  if (!Number.isFinite(totalSol) || totalSol <= 0) {
+    return { success: false, error: "deploy_hybrid_pool requires a positive amount_sol/amount_y" };
+  }
+  const spotAmount = totalSol * ratio;
+  const bidAskAmount = totalSol * (1 - ratio);
+
+  // Generate a stable hybrid group id for tracking (1 NFT, but keep group semantics for compatibility).
+  const hybridGroupId = `hybrid_${pool_address.slice(0, 8)}_${Date.now()}`;
+
+  log(
+    "deploy",
+    `Hybrid SINGLE-POSITION start: pool=${pool_address.slice(0,8)} total=${totalSol} SOL → phase1 deploy spot=${spotAmount.toFixed(4)} (${(ratio*100).toFixed(0)}%) + phase2 add bid_ask=${bidAskAmount.toFixed(4)} (${((1-ratio)*100).toFixed(0)}%) group=${hybridGroupId}`
+  );
+
+  // ── Phase 1: Deploy position with Spot strategy × 30% (creates NFT + initial liquidity) ──
+  // Reuses deployPosition logic which auto-handles wide-range path (createExtendedEmptyPosition + addLiquidity).
+  const phase1Result = await deployPosition({
+    pool_address,
+    amount_sol: spotAmount,
+    amount_y: spotAmount,
+    strategy: "spot",
+    bins_below,
+    bins_above,
+    downside_pct,
+    upside_pct,
+    pool_name,
+    bin_step,
+    base_fee,
+    volatility,
+    fee_tvl_ratio,
+    organic_score,
+    initial_value_usd,
+    entry_mcap,
+    entry_tvl,
+    entry_volume,
+    entry_holders,
+    hybrid_group_id: hybridGroupId,
+    hybrid_role: "spot",
+  });
+
+  if (!phase1Result.success) {
+    return {
+      success: false,
+      error: `Hybrid abort: phase 1 (spot deploy) failed: ${phase1Result.error}`,
+      phase1_result: phase1Result,
+    };
+  }
+
+  // Re-classify tracked position from "spot" (Phase 1 auto-track) → "hybrid".
+  // The position has BOTH spot + bid_ask distribution, so display as hybrid.
+  setPositionStrategy(phase1Result.position, "hybrid", {
+    spot_amount: spotAmount,
+    bid_ask_amount: bidAskAmount,
+    spot_ratio: ratio,
+    spot_distribution: "uniform",
+    bid_ask_distribution: "u_shaped",
+  });
+
+  log(
+    "deploy",
+    `Hybrid phase 1 done: nft=${phase1Result.position?.slice(0,8)} spot_amount=${spotAmount} SOL. Starting phase 2 (add bid_ask)...`
+  );
+
+  // ── Phase 2: Add BidAsk liquidity × 70% to the SAME position NFT ──
+  try {
+    const { StrategyType } = await getDLMM();
+    const pool = await getPool(pool_address);
+    const activeBin = await pool.getActiveBin();
+    const actualBinStep = pool.lbPair.binStep;
+
+    // Resolve bin range (same as phase 1)
+    let minBinId, maxBinId;
+    if (downside_pct != null) {
+      const { getBinIdFromPrice, getPriceOfBinByBinId } = await getDLMM();
+      const activePrice = Number(getPriceOfBinByBinId(activeBin.binId, actualBinStep).toString());
+      const lowerTargetPrice = activePrice * (1 - Number(downside_pct) / 100);
+      minBinId = getBinIdFromPrice(lowerTargetPrice, actualBinStep, true);
+      maxBinId = activeBin.binId;
+    } else {
+      const coverageBins = Number(bins_below);
+      minBinId = activeBin.binId - coverageBins;
+      maxBinId = activeBin.binId;
+    }
+
+    const positionPubkey = new PublicKey(phase1Result.position);
+    const addTxs = await pool.addLiquidityByStrategyChunkable({
+      positionPubKey: positionPubkey,
+      user: getWallet().publicKey,
+      totalXAmount: new BN(0),
+      totalYAmount: new BN(Math.floor(bidAskAmount * 1e9)),
+      strategy: { minBinId, maxBinId, strategyType: StrategyType.BidAsk },
+      slippage: 10,
+    });
+    const addTxArray = Array.isArray(addTxs) ? addTxs : [addTxs];
+    const phase2Txs = [];
+    for (let i = 0; i < addTxArray.length; i++) {
+      const txHash = await sendAndConfirmTransaction(getConnection(), addTxArray[i], [getWallet()]);
+      phase2Txs.push(txHash);
+      log("deploy", `BidAsk addLiquidity tx ${i + 1}/${addTxArray.length}: ${txHash}`);
+    }
 
     _positionsCacheAt = 0;
-    const signalSnapshot = config.darwin?.enabled
-      ? getAndClearStagedSignals(pool_address, baseMint)
-      : null;
-    trackPosition({
-      position: newPosition.publicKey.toString(),
-      pool: pool_address,
-      pool_name,
-      strategy: activeStrategy,
-      bin_range: { min: minBinId, max: maxBinId, bins_below: activeBinsBelow, bins_above: activeBinsAbove },
-      bin_step,
-      volatility: normalizedVolatility,
-      fee_tvl_ratio,
-      organic_score,
-      amount_sol: finalAmountY,
-      amount_x: finalAmountX,
-      active_bin: activeBin.binId,
-      initial_value_usd,
-      signal_snapshot: signalSnapshot,
-      entry_mcap,
-      entry_tvl,
-      entry_volume,
-      entry_holders,
-    });
 
-    appendDecision({
-      type: "deploy",
-      actor: "SCREENER",
-      pool: pool_address,
-      pool_name,
-      position: newPosition.publicKey.toString(),
-      summary: `Deployed ${finalAmountY} SOL with ${activeStrategy}`,
-      reason: `Chosen range ${minBinId}→${maxBinId} around active bin ${activeBin.binId}`,
-      risks: [
-        normalizedVolatility != null ? `volatility ${normalizedVolatility}` : null,
-        fee_tvl_ratio != null ? `fee/TVL ${fee_tvl_ratio}%` : null,
-      ].filter(Boolean),
-      metrics: {
-        amount_sol: finalAmountY,
-        strategy: activeStrategy,
-        active_bin: activeBin.binId,
-        min_bin: minBinId,
-        max_bin: maxBinId,
-        downside_pct: downside_pct ?? null,
-        upside_pct: upside_pct ?? null,
-      },
-    });
+    const allTxs = [...(phase1Result.txs || []), ...phase2Txs];
+
+    // Sync state to reflect full hybrid amount on-chain (Phase 1 only tracked spot leg).
+    recordAddLiquidity(phase1Result.position, bidAskAmount, "hybrid_leg");
+
+    log(
+      "deploy",
+      `Hybrid SINGLE-POSITION complete: pool=${pool_address.slice(0,8)} nft=${phase1Result.position?.slice(0,8)} total=${totalSol} SOL txs=${allTxs.length}`
+    );
 
     return {
       success: true,
-      position: newPosition.publicKey.toString(),
+      hybrid: true,
+      hybrid_single_position: true,
       pool: pool_address,
       pool_name,
-      bin_range: { min: minBinId, max: maxBinId, active: activeBin.binId },
-      price_range: { min: minPrice, max: maxPrice },
-      range_coverage: {
-        downside_pct: downsideCoveragePct,
-        upside_pct: upsideCoveragePct,
-        width_pct: totalWidthPct,
-        active_price: activePrice,
+      hybrid_group_id: hybridGroupId,
+      position: phase1Result.position,
+      bin_range: phase1Result.bin_range,
+      price_range: phase1Result.price_range,
+      range_coverage: phase1Result.range_coverage,
+      bin_step: phase1Result.bin_step,
+      base_fee: phase1Result.base_fee,
+      strategy: "hybrid",
+      // Phase breakdown for tracking + display
+      hybrid_breakdown: {
+        spot_amount: spotAmount,
+        bid_ask_amount: bidAskAmount,
+        spot_ratio: ratio,
+        spot_distribution: "uniform",
+        bid_ask_distribution: "u_shaped",
       },
-      bin_step: actualBinStep,
-      base_fee: actualBaseFee,
-      strategy: activeStrategy,
-      wide_range: isWideRange,
-      amount_x: finalAmountX,
-      amount_y: finalAmountY,
-      txs: txHashes,
+      amount_x: 0,
+      amount_y: totalSol,
+      txs: allTxs,
     };
   } catch (error) {
-    log("deploy_error", error.message);
-    return { success: false, error: error.message };
+    log("deploy_error", `Hybrid phase 2 (add bid_ask) failed: ${error.message}`);
+    // Downgrade the spot-only position from "hybrid" → "spot" and clear misleading breakdown.
+    // Phase 1 position is real on-chain; bid_ask leg is missing → state must reflect reality.
+    try {
+      downgradeHybridToSpot(phase1Result.position, `Phase 2 (bid_ask addLiquidity) failed: ${error.message}. Position now runs as spot-only with ${spotAmount} SOL.`);
+    } catch (_cleanupErr) {
+      log("state_warn", `Phase 2 fail cleanup partial: ${_cleanupErr.message}`);
+    }
+    return {
+      success: false,
+      error: `Hybrid phase 2 failed: ${error.message}. Phase 1 spot position ${phase1Result.position} is active with ${spotAmount} SOL but missing bid_ask leg.`,
+      phase1_result: phase1Result,
+      // Mark as orphan: spot leg is live but bid_ask missing → caller can recover or let it run as spot-only.
+      orphan: true,
+      pool: pool_address,
+      hybrid_group_id: hybridGroupId,
+    };
   }
 }
 
@@ -1403,6 +1694,8 @@ export async function getWalletPositions({ wallet_address }) {
         : null;
       const derivedPnlPct = p ? deriveOpenPnlPct(p, solMode) : null;
 
+      // Mcap range: REMOVED 2026-07-01 per user — bikin /positions terlalu penuh.
+
       return {
         position:           r.position,
         pool:               r.pool,
@@ -1502,6 +1795,14 @@ export async function closePosition({ position_address, reason }) {
   }
 
   const tracked = getTrackedPosition(position_address);
+
+  let solPrice = 0;
+  try {
+    const balances = await getWalletBalances();
+    solPrice = balances?.sol_price || 0;
+  } catch (e) {
+    log("close_warn", `Failed to fetch SOL price from getWalletBalances: ${e.message}`);
+  }
 
   try {
     log("close", `Closing position: ${position_address}`);
@@ -1610,6 +1911,17 @@ export async function closePosition({ position_address, reason }) {
 
       recordClose(position_address, reason || "agent decision");
 
+      // Immediate ghost reconciliation — kills the 5-60s display lag until next PnL poll catches up.
+      // Any other state entries without on-chain NFT get auto-closed here.
+      try {
+        const liveAfter = await getMyPositions({ force: true, silent: true }).catch(() => null);
+        if (liveAfter?.positions) {
+          syncOpenPositions(liveAfter.positions.map((p) => p.position).filter(Boolean));
+        }
+      } catch (e) {
+        log("close_warn", `Post-close ghost sync skipped: ${e.message}`);
+      }
+
       if (tracked) {
         const deployedAt = new Date(tracked.deployed_at).getTime();
         const minutesHeld = Math.floor((Date.now() - deployedAt) / 60000);
@@ -1621,6 +1933,8 @@ export async function closePosition({ position_address, reason }) {
         let pnlUsd = 0;
         let pnlTrueUsd = 0;
         let pnlPct = 0;
+        let pnlSol = 0;
+        let pnlSolPct = 0;
         let finalValueUsd = 0;
         let initialUsd = 0;
         let feesUsd = tracked.total_fees_claimed_usd || 0;
@@ -1635,6 +1949,10 @@ export async function closePosition({ position_address, reason }) {
                 pnlTrueUsd = safeNum(posEntry.pnlUsd);
                 pnlUsd = config.management.solMode ? getClosedPnlValue(posEntry, true) : pnlTrueUsd;
                 pnlPct = getClosedPnlPct(posEntry, config.management.solMode);
+                // SOL-denominated PnL (independent of USD/SOL price) — used for cooldown exemption
+                // when USD PnL is negative but SOL PnL is positive (e.g., SOL price dropped but LP gained SOL).
+                pnlSol = getClosedPnlValue(posEntry, true);
+                pnlSolPct = getClosedPnlPct(posEntry, true);
                 finalValueUsd = parseFloat(posEntry.allTimeWithdrawals?.total?.usd || 0);
                 initialUsd = parseFloat(posEntry.allTimeDeposits?.total?.usd || 0);
                 feesUsd = parseFloat(posEntry.allTimeFees?.total?.usd || 0) || feesUsd;
@@ -1681,8 +1999,11 @@ export async function closePosition({ position_address, reason }) {
           organic_score: tracked.organic_score || null,
           amount_sol: tracked.amount_sol,
           fees_earned_usd: feesUsd,
+          fees_earned_sol: tracked.total_fees_claimed_sol || 0,
           final_value_usd: finalValueUsd,
           initial_value_usd: initialUsd,
+          pnl_sol: pnlSol,
+          pnl_sol_pct: pnlSolPct,
           minutes_in_range: minutesHeld - minutesOOR,
           minutes_held: minutesHeld,
           close_reason: reason || "agent decision",
@@ -1725,8 +2046,20 @@ export async function closePosition({ position_address, reason }) {
           close_txs: closeTxHashes,
           txs: txHashes,
           pnl_usd: pnlUsd,
+          pnl_true_usd: pnlTrueUsd,
+          pnl_sol: pnlSol,
+          pnl_sol_pct: pnlSolPct,
           pnl_pct: pnlPct,
           base_mint: closeBaseMint,
+          fees_sol: solPrice > 0 ? (feesUsd || 0) / solPrice : 0,
+          sol_price: solPrice,
+          minutes_held: minutesHeld,
+          minutes_oor: minutesOOR,
+          in_range_pct: minutesHeld > 0 ? Math.round(((minutesHeld - minutesOOR) / minutesHeld) * 100) : 100,
+          close_reason: reason || "agent decision",
+          bin_step: tracked.bin_step ?? null,
+          volatility: tracked.volatility ?? null,
+          fee_tvl_ratio: tracked.fee_tvl_ratio ?? null,
         };
       }
 
@@ -1893,6 +2226,8 @@ export async function closePosition({ position_address, reason }) {
       let pnlUsd = 0;
       let pnlTrueUsd = 0;
       let pnlPct = 0;
+      let pnlSol = 0;
+      let pnlSolPct = 0;
       let finalValueUsd = 0;
       let initialUsd = 0;
       let feesUsd = tracked.total_fees_claimed_usd || 0;
@@ -1907,6 +2242,8 @@ export async function closePosition({ position_address, reason }) {
               const nextPnlUsd = safeNum(posEntry.pnlUsd);
               const nextPnlValue = config.management.solMode ? getClosedPnlValue(posEntry, true) : nextPnlUsd;
               const nextPnlPct = getClosedPnlPct(posEntry, config.management.solMode);
+              const nextPnlSol = getClosedPnlValue(posEntry, true);
+              const nextPnlSolPct = getClosedPnlPct(posEntry, true);
               const nextFinalValueUsd = parseFloat(posEntry.allTimeWithdrawals?.total?.usd || 0);
               const nextInitialUsd = parseFloat(posEntry.allTimeDeposits?.total?.usd || 0);
               const nextFeesUsd = parseFloat(posEntry.allTimeFees?.total?.usd || 0) || feesUsd;
@@ -1917,10 +2254,12 @@ export async function closePosition({ position_address, reason }) {
                 pnlTrueUsd    = nextPnlUsd;
                 pnlUsd        = nextPnlValue;
                 pnlPct        = nextPnlPct;
+                pnlSol        = nextPnlSol;
+                pnlSolPct     = nextPnlSolPct;
                 finalValueUsd = nextFinalValueUsd;
                 initialUsd    = nextInitialUsd;
                 feesUsd       = nextFeesUsd;
-                log("close", `Closed PnL from API: pnl=${pnlUsd.toFixed(2)} ${config.management.solMode ? "SOL" : "USD"} (${pnlPct.toFixed(2)}%), withdrawn=${finalValueUsd.toFixed(2)} USD, deposited=${initialUsd.toFixed(2)} USD`);
+                log("close", `Closed PnL from API: pnl=${pnlUsd.toFixed(2)} ${config.management.solMode ? "SOL" : "USD"} (${pnlPct.toFixed(2)}%), SOL pnl=${pnlSol.toFixed(4)} (${pnlSolPct.toFixed(2)}%), withdrawn=${finalValueUsd.toFixed(2)} USD, deposited=${initialUsd.toFixed(2)} USD`);
                 break;
               }
             } else {
@@ -1986,8 +2325,11 @@ export async function closePosition({ position_address, reason }) {
         organic_score: tracked.organic_score || null,
         amount_sol: tracked.amount_sol,
         fees_earned_usd: feesUsd,
+        fees_earned_sol: tracked.total_fees_claimed_sol || 0,
         final_value_usd: finalValueUsd,
         initial_value_usd: initialUsd,
+        pnl_sol: pnlSol,
+        pnl_sol_pct: pnlSolPct,
         minutes_in_range: minutesHeld - minutesOOR,
         minutes_held: minutesHeld,
         close_reason: reason || "agent decision",
@@ -2028,8 +2370,20 @@ export async function closePosition({ position_address, reason }) {
         close_txs: closeTxHashes,
         txs: txHashes,
         pnl_usd: pnlUsd,
+        pnl_true_usd: pnlTrueUsd,
+        pnl_sol: pnlSol,
+        pnl_sol_pct: pnlSolPct,
         pnl_pct: pnlPct,
         base_mint: closeBaseMint,
+        fees_sol: solPrice > 0 ? (feesUsd || 0) / solPrice : 0,
+        sol_price: solPrice,
+        minutes_held: minutesHeld,
+        minutes_oor: minutesOOR,
+        in_range_pct: minutesHeld > 0 ? Math.round(((minutesHeld - minutesOOR) / minutesHeld) * 100) : 100,
+        close_reason: reason || "agent decision",
+        bin_step: tracked.bin_step ?? null,
+        volatility: tracked.volatility ?? null,
+        fee_tvl_ratio: tracked.fee_tvl_ratio ?? null,
       };
     }
 

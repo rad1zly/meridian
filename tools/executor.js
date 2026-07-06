@@ -1,7 +1,8 @@
-import { discoverPools, getPoolDetail, getTopCandidates } from "./screening.js";
+import { discoverPools, getPoolDetail, getTopCandidates, getComputedBinsBelow } from "./screening.js";
 import {
   getActiveBin,
   deployPosition,
+  deployHybridPool,
   getMyPositions,
   getWalletPositions,
   getPositionPnl,
@@ -12,7 +13,7 @@ import {
 import { getWalletBalances, swapToken } from "./wallet.js";
 import { studyTopLPers } from "./study.js";
 import { addLesson, clearAllLessons, clearPerformance, removeLessonsByKeyword, getPerformanceHistory, pinLesson, unpinLesson, listLessons } from "../lessons.js";
-import { setPositionInstruction } from "../state.js";
+import { setPositionInstruction, syncOpenPositions } from "../state.js";
 
 import { getPoolMemory, addPoolNote } from "../pool-memory.js";
 import { addStrategy, listStrategies, getStrategy, setActiveStrategy, removeStrategy } from "../strategy-library.js";
@@ -252,6 +253,7 @@ const toolMap = {
   get_position_pnl: getPositionPnl,
   get_active_bin: getActiveBin,
   deploy_position: deployPosition,
+  deploy_hybrid_pool: deployHybridPool,
   get_my_positions: getMyPositions,
   get_wallet_positions: getWalletPositions,
   search_pools: searchPools,
@@ -585,6 +587,7 @@ const toolMap = {
 
 // Tools that modify on-chain state (need extra safety checks)
 const WRITE_TOOLS = new Set([
+  "deploy_hybrid_pool",
   "deploy_position",
   "claim_fees",
   "close_position",
@@ -678,9 +681,32 @@ export async function executeTool(name, args) {
       if (name === "swap_token" && result.tx) {
         notifySwap({ inputSymbol: args.input_mint?.slice(0, 8), outputSymbol: args.output_mint === "So11111111111111111111111111111111111111112" || args.output_mint === "SOL" ? "SOL" : args.output_mint?.slice(0, 8), amountIn: result.amount_in, amountOut: result.amount_out, tx: result.tx }).catch(() => {});
       } else if (name === "deploy_position") {
-        notifyDeploy({ pair: result.pool_name || args.pool_name || args.pool_address?.slice(0, 8), amountSol: args.amount_y ?? args.amount_sol ?? 0, position: result.position, tx: result.txs?.[0] ?? result.tx, priceRange: result.price_range, rangeCoverage: result.range_coverage, binStep: result.bin_step, baseFee: result.base_fee }).catch(() => {});
+        notifyDeploy({ pair: result.pool_name || args.pool_name || args.pool_address?.slice(0, 8), amountSol: args.amount_y ?? args.amount_sol ?? 0, position: result.position, tx: result.txs?.[0] ?? result.tx, priceRange: result.price_range, rangeCoverage: result.range_coverage, binStep: result.bin_step, baseFee: result.base_fee, strategy: result.strategy, activeBin: result.bin_range?.active }).catch(() => {});
       } else if (name === "close_position") {
-        notifyClose({ pair: result.pool_name || args.position_address?.slice(0, 8), pnlUsd: result.pnl_usd ?? 0, pnlPct: result.pnl_pct ?? 0 }).catch(() => {});
+        // Use result.pnl_sol directly (Meteora's SOL-denominated PnL at close time).
+        // Do NOT recompute via pnl_true_usd/sol_price; that flips sign when USD PnL is
+        // negative but SOL position actually gained (e.g. SOL price dropped during LP).
+        // skip_notify flag: management cycle aggregates hybrid closes and emits 1 notif per pool.
+        if (!args.skip_notify) {
+          const _solPrice = result.sol_price ?? 0;
+          const _feesSol = result.fees_sol ?? 0;
+          notifyClose({
+            pair: result.pool_name || args.position_address?.slice(0, 8),
+            pnl_sol: result.pnl_sol ?? 0,
+            pnl_usd: result.pnl_true_usd ?? result.pnl_usd ?? 0,
+            sol_price: _solPrice,
+            pnl_pct: result.pnl_pct ?? 0,
+            fees_sol: _feesSol,
+            fees_usd: _solPrice > 0 ? _feesSol * _solPrice : 0,
+            minutes_held: result.minutes_held ?? 0,
+            minutes_oor: result.minutes_oor ?? 0,
+            in_range_pct: result.in_range_pct ?? 100,
+            close_reason: result.close_reason ?? "agent decision",
+            bin_step: result.bin_step ?? null,
+            volatility: result.volatility ?? null,
+            fee_tvl_ratio: result.fee_tvl_ratio ?? null,
+          }).catch((e) => log("notify_warn", `notifyClose exception: ${e.message}`));
+        }
         // Note low-yield closes in pool memory so screener avoids redeploying
         if (args.reason && args.reason.toLowerCase().includes("yield")) {
           const poolAddr = result.pool || args.pool_address;
@@ -699,6 +725,23 @@ export async function executeTool(name, args) {
       } else if (name === "claim_fees" && config.management.autoSwapAfterClaim && result.base_mint) {
         await swapBaseToSolWithRetry(result.base_mint, "after claim");
       }
+    } else if (name === "deploy_position") {
+      // Post-failure crosscheck: phantom position cleanup + stranded base-token recovery.
+      // Only runs when the actual deploy function returned failure (not safety block,
+      // which short-circuits before reaching here).
+      const recovery = await recoverFromDeployFailure(args, result);
+      log("executor", `Deploy recovery crosscheck: ${recovery.summary}`);
+      result.recovery = recovery;
+    } else if (name === "deploy_hybrid_pool" && result?.orphan && result?.phase1_result?.position) {
+      // Hybrid (1-NFT) partial failure: phase 1 (spot deploy) succeeded but phase 2 (add bid_ask) failed.
+      // Spot leg is live but bid_ask leg missing. Auto-close to recover SOL (don't let it run as spot-only
+      // without the user knowing — and recover rent + initial liquidity).
+      log("executor", `Hybrid (1-NFT) partial failure: auto-closing phase1 spot ${result.phase1_result.position.slice(0,8)} on ${args.pool_name || args.pool_address?.slice(0,8)}`);
+      const { closePosition } = await import("./dlmm.js");
+      const closeRes = await closePosition({ position_address: result.phase1_result.position, reason: "hybrid_phase2_orphan_recovery" }).catch(e => ({ error: e.message, success: false }));
+      const ok = closeRes?.success !== false && !closeRes?.error;
+      log("executor", `Hybrid phase2 orphan close: ${ok ? "recovered" : `FAILED — ${closeRes?.error || "unknown"}`}`);
+      result.orphan_recovery = { attempted: true, success: ok, close_result: closeRes };
     }
 
     return result;
@@ -719,6 +762,60 @@ export async function executeTool(name, args) {
       tool: name,
     };
   }
+}
+
+/**
+ * Crosscheck after a deploy_position failure: detect and recover from partial-fail
+ * scenarios where the zap-in submit partially succeeded (e.g. swap tx confirmed
+ * but addLiquidity rejected by slippage → SOL converted to base token, no
+ * position exists) or where state.positions has a phantom entry.
+ *
+ * Action plan:
+ *   1. Force-refresh on-chain positions and run syncOpenPositions — auto-closes any
+ *      state-tracked position that doesn't exist on-chain (out of grace period).
+ *   2. If args.pool_address provided, check wallet for the base mint of that pool —
+ *      if balance > $0.10 and doesn't correspond to a real open position, swap back
+ *      to SOL via swapBaseToSolWithRetry.
+ *
+ * Returns { actions: [...], summary } so the LLM can see what was done. Always
+ * resolves — never throws upward (caller already has a failure result).
+ */
+async function recoverFromDeployFailure(args, originalResult) {
+  const actions = [];
+  const poolAddr = args?.pool_address;
+  const failedBaseMint = args?.base_mint || null;
+
+  try {
+    // (1) Reconcile state vs on-chain
+    const live = await getMyPositions({ force: true, silent: true }).catch(() => null);
+    const liveAddresses = (live?.positions || []).map((p) => p.position).filter(Boolean);
+    const beforeOpen = liveAddresses.length;
+    syncOpenPositions(liveAddresses);
+    actions.push(`synced state against ${beforeOpen} on-chain position(s)`);
+  } catch (e) {
+    actions.push(`state-sync skipped: ${e.message}`);
+  }
+
+  // (2) Recover stranded base tokens only if we know the failed pool's base mint
+  if (failedBaseMint) {
+    try {
+      const balances = await getWalletBalances({}).catch(() => null);
+      const token = balances?.tokens?.find((t) => t.mint === failedBaseMint);
+      if (token && token.usd >= 0.10) {
+        const { swapped, result: swapResult } = await swapBaseToSolWithRetry(failedBaseMint, "after failed deploy");
+        if (swapped) {
+          const out = swapResult?.amount_out ? ` (${swapResult.amount_out.toFixed(4)} SOL)` : "";
+          actions.push(`recovered stranded base token (${token.symbol || failedBaseMint.slice(0, 8)}) → SOL${out}`);
+        } else {
+          actions.push(`stranded base token (${token.symbol || failedBaseMint.slice(0, 8)}) detected but auto-swap failed — manual intervention needed`);
+        }
+      }
+    } catch (e) {
+      actions.push(`base-token recovery skipped: ${e.message}`);
+    }
+  }
+
+  return { actions, summary: actions.length ? actions.join("; ") : "no recovery actions needed" };
 }
 
 /**
@@ -751,6 +848,34 @@ async function runSafetyChecks(name, args) {
       }
       const requestedBinsBelow = Number(args.bins_below ?? config.strategy.defaultBinsBelow ?? config.strategy.minBinsBelow);
       const requestedBinsAbove = Number(args.bins_above ?? 0);
+
+      // ─── COVERAGE FORMULA ENFORCEMENT (2026-06-29 HARDCODED) ────────────────
+      // User explicitly disabled Formula A as a default. If the screening layer
+      // computed a coverage value for this pool_address, the LLM's bins_below
+      // is overridden with the coverage value (with override log for visibility).
+      // If coverage unavailable (null → SKIP candidate per prompt instructions),
+      // we still reject the deploy here as a defense-in-depth.
+      const coverageBins = getComputedBinsBelow(args.pool_address);
+      const poolLabel = String(args.pool_name || args.pool_address || "unknown").slice(0, 24);
+      if (Number.isFinite(coverageBins)) {
+        if (requestedBinsBelow !== coverageBins) {
+          log(
+            "executor",
+            `BINS_BELOW OVERRIDE: ${poolLabel} LLM=${requestedBinsBelow} → coverage=${coverageBins} (Formula A disabled)`
+          );
+        }
+        args.bins_below = coverageBins;
+      } else {
+        log(
+          "executor",
+          `BINS_BELOW SKIP: ${poolLabel} no coverage data — Formula A disabled, refusing deploy_position`
+        );
+        return {
+          pass: false,
+          reason: `coverage_bins_below is null for ${poolLabel} — Formula A is disabled (user-config 2026-06-29). Either retry when GMGN snapshot is available, or skip this candidate.`,
+        };
+      }
+
       const minBinsBelow = Math.max(MIN_SAFE_BINS_BELOW, Number(config.strategy.minBinsBelow ?? MIN_SAFE_BINS_BELOW));
       const isSingleSidedSol = deployAmountY > 0 && deployAmountX <= 0;
       const requestedTotalBins = requestedBinsBelow + requestedBinsAbove;
@@ -801,11 +926,14 @@ async function runSafetyChecks(name, args) {
       }
 
       // Check position count limit + duplicate pool guard — force fresh scan to avoid stale cache
+      // Slot semantics: hybrid = 1 pool = 1 slot (not 2 NFTs). getMyPositions counts raw NFTs, so use state.
       const positions = await getMyPositions({ force: true });
-      if (positions.total_positions >= config.risk.maxPositions) {
+      const { getOpenSlotCount } = await import("../state.js");
+      const openSlots = getOpenSlotCount();
+      if (openSlots >= config.risk.maxPositions) {
         return {
           pass: false,
-          reason: `Max positions (${config.risk.maxPositions}) reached. Close a position first.`,
+          reason: `Max pool slots (${config.risk.maxPositions}) reached. ${openSlots} pool(s) currently active. Close one first.`,
         };
       }
       const alreadyInPool = positions.positions.some(
@@ -863,6 +991,94 @@ async function runSafetyChecks(name, args) {
           return {
             pass: false,
             reason: `Insufficient SOL: have ${balance.sol} SOL, need ${minRequired} SOL (${amountY} deploy + ${gasReserve} gas reserve).`,
+          };
+        }
+      }
+
+      return { pass: true };
+    }
+
+    case "deploy_hybrid_pool": {
+      // Hybrid deploy: 1 pool = 1 slot, deploys 2 NFTs (spot 30% + bid_ask 70%).
+      // Reuses most deploy_position validation, but counts slot-by-pool not by-NFT.
+      const poolThresholds = await validateDeployPoolThresholds(args);
+      if (!poolThresholds.pass) return poolThresholds;
+      if (poolThresholds.entryMarketData) Object.assign(args, poolThresholds.entryMarketData);
+
+      const minStep = config.screening.minBinStep;
+      const maxStep = config.screening.maxBinStep;
+      if (args.bin_step != null && (args.bin_step < minStep || args.bin_step > maxStep)) {
+        return { pass: false, reason: `bin_step ${args.bin_step} is outside the allowed range of [${minStep}-${maxStep}].` };
+      }
+
+      const deployAmountY = Number(args.amount_y ?? args.amount_sol ?? 0);
+      if (!Number.isFinite(deployAmountY) || deployAmountY <= 0) {
+        return { pass: false, reason: "deploy_hybrid_pool requires a positive amount_y/amount_sol." };
+      }
+
+      // Coverage override (Formula A disabled)
+      const coverageBins = getComputedBinsBelow(args.pool_address);
+      const poolLabel = String(args.pool_name || args.pool_address || "unknown").slice(0, 24);
+      if (Number.isFinite(coverageBins)) {
+        if (Number(args.bins_below ?? -1) !== coverageBins) {
+          log("executor", `BINS_BELOW OVERRIDE: ${poolLabel} LLM=${args.bins_below} → coverage=${coverageBins} (hybrid)`);
+        }
+        args.bins_below = coverageBins;
+      } else {
+        log("executor", `BINS_BELOW SKIP: ${poolLabel} no coverage data — refusing deploy_hybrid_pool`);
+        return {
+          pass: false,
+          reason: `coverage_bins_below is null for ${poolLabel} — Formula A is disabled. Either retry when GMGN snapshot is available, or skip this candidate.`,
+        };
+      }
+
+      // Position slot count: 1 pool = 1 slot regardless of NFT count inside
+      const positions = await getMyPositions({ force: true });
+      const openPoolAddresses = new Set();
+      for (const p of positions.positions || []) {
+        if (p.pool) openPoolAddresses.add(p.pool);
+      }
+      if (openPoolAddresses.size >= config.risk.maxPositions) {
+        return {
+          pass: false,
+          reason: `Max pool slots (${config.risk.maxPositions}) reached. ${openPoolAddresses.size} pool(s) currently active. Close one first.`,
+        };
+      }
+      if (openPoolAddresses.has(args.pool_address)) {
+        return {
+          pass: false,
+          reason: `Already have hybrid pair in pool ${args.pool_address}. Close both NFTs first before re-deploying.`,
+        };
+      }
+
+      // Amount bounds
+      const minDeploy = Math.max(0.1, config.management.deployAmountSol);
+      if (deployAmountY < minDeploy) {
+        return {
+          pass: false,
+          reason: `Total hybrid amount ${deployAmountY} SOL is below minimum (${minDeploy} SOL).`,
+        };
+      }
+      if (deployAmountY > config.risk.maxDeployAmount) {
+        return {
+          pass: false,
+          reason: `Total hybrid amount ${deployAmountY} SOL exceeds maximum allowed per pool (${config.risk.maxDeployAmount} SOL).`,
+        };
+      }
+
+      // Balance check — hybrid deploys 1 NFT × multiple txs (single-position refactor 2026-07-04).
+      // Cost: 1 position account rent + 1 set of bin arrays + ~3-5 txs (1 create + 1-2 spot adds + 1-2 bid_ask adds).
+      // If wallet insufficient, hybrid deploy fails — caller should reduce amount_y before calling.
+      if (process.env.DRY_RUN !== "true") {
+        const balance = await getWalletBalances();
+        const gasReserve = config.management.gasReserve;
+        const txFeeBufferHybrid = Number(config.risk.hybridTxFeeBuffer ?? 0.05);
+        const minRequiredHybrid = deployAmountY + gasReserve + txFeeBufferHybrid;
+
+        if (balance.sol < minRequiredHybrid) {
+          return {
+            pass: false,
+            reason: `Insufficient SOL for hybrid deploy: have ${balance.sol.toFixed(4)} SOL, need ${minRequiredHybrid.toFixed(4)} SOL (${deployAmountY} deploy + ${gasReserve} gas reserve + ${txFeeBufferHybrid} tx fee buffer).`,
           };
         }
       }

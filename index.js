@@ -6,7 +6,7 @@ import { fileURLToPath } from "url";
 import { agentLoop } from "./agent.js";
 import { log } from "./logger.js";
 import { getMyPositions, closePosition, getActiveBin } from "./tools/dlmm.js";
-import { getWalletBalances } from "./tools/wallet.js";
+import { getWalletBalances, swapToken } from "./tools/wallet.js";
 import { getTopCandidates, degenScore } from "./tools/screening.js";
 import { config, reloadScreeningThresholds, computeDeployAmount } from "./config.js";
 import { evolveThresholds, getPerformanceSummary } from "./lessons.js";
@@ -23,9 +23,10 @@ import {
   notifyOutOfRange,
   isEnabled as telegramEnabled,
   createLiveMessage,
+  notifyClose,
 } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
-import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, updatePnlAndCheckExits, confirmPeak, registerExitSignal } from "./state.js";
+import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, getOpenPositionGroups, getOpenSlotCount, setPositionInstruction, updatePnlAndCheckExits, confirmPeak, registerExitSignal, syncOpenPositions } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
 import { recordPositionSnapshot, recallForPool, addPoolNote } from "./pool-memory.js";
 import { checkSmartWalletsOnPool } from "./smart-wallets.js";
@@ -162,22 +163,79 @@ async function executeManagementActions(actionPositions, actionMap, { liveMessag
   const lines = [];
   const instructionPositions = [];
 
-  const mechanical = actionPositions.filter(p => actionMap.get(p.position).action !== "INSTRUCTION");
+  // ── Hybrid sync close (2026-07-03 HARDCODED) ─────────────────
+  // If ANY NFT in a pool is marked CLOSE, all NFTs in that pool close together.
+  // 1 pool = 1 trading decision. Lifecycle is synchronous.
+  const poolHasClose = new Set();
+  for (const p of actionPositions) {
+    const act = actionMap.get(p.position);
+    if (act.action === "CLOSE" && p.pool) poolHasClose.add(p.pool);
+  }
+  let expandedActions = actionPositions;
+  if (poolHasClose.size > 0) {
+    const allPositions = await getMyPositions({ force: true }).catch(() => null);
+    const expanded = [...actionPositions];
+    const seen = new Set(actionPositions.map((p) => p.position));
+    for (const p of (allPositions?.positions || [])) {
+      if (p.pool && poolHasClose.has(p.pool) && !seen.has(p.position)) {
+        expanded.push(p);
+        seen.add(p.position);
+      }
+    }
+    if (expanded.length > actionPositions.length) {
+      log("cron", `Hybrid sync close: expanded ${actionPositions.length} → ${expanded.length} position(s) across ${poolHasClose.size} pool(s)`);
+    }
+    expandedActions = expanded;
+  }
+
+  const mechanical = expandedActions.filter(p => actionMap.get(p.position)?.action !== "INSTRUCTION");
   if (mechanical.length) {
     log("cron", `Management: executing ${mechanical.length} mechanical action(s) — no LLM`);
   }
 
-  for (const p of actionPositions) {
-    const act = actionMap.get(p.position);
+  // Collect close results by pool for aggregated notification (hybrid = 1 notif per pool)
+  const closeResultsByPool = new Map(); // pool → { pair, pnl_sol, pnl_usd, fees_sol, fees_usd, sol_price, pnl_pct, minutes_held, minutes_oor, in_range_pct, close_reason, bin_step, volatility, fee_tvl_ratio, is_hybrid, leg_count }
+
+  for (const p of expandedActions) {
+    const act = actionMap.get(p.position) || { action: "CLOSE", reason: "hybrid partner sync" };
     if (act.action === "INSTRUCTION") { instructionPositions.push(p); continue; }
 
     if (act.action === "CLOSE") {
       const reason = act.reason || (act.rule ? `Rule ${act.rule}` : "rule close");
       await liveMessage?.toolStart("close_position");
-      const res = await executeTool("close_position", { position_address: p.position, reason }).catch(e => ({ error: e.message }));
+      // skip_notify=true: don't fire per-NFT notifyClose in executor. We aggregate below.
+      const res = await executeTool("close_position", { position_address: p.position, reason, skip_notify: true }).catch(e => ({ error: e.message }));
       const ok = res?.success !== false && !res?.error && !res?.blocked;
       await liveMessage?.toolFinish("close_position", res, ok);
       lines.push(`${p.pair}: ${ok ? `closed (${reason})` : `close FAILED — ${res?.error || res?.reason || "unknown"}`}`);
+      // Stash per-position result for aggregation by pool
+      if (ok && p.pool) {
+        if (!closeResultsByPool.has(p.pool)) {
+          closeResultsByPool.set(p.pool, {
+            pair: p.pair,
+            pool: p.pool,
+            pnl_sol: 0, pnl_usd: 0, fees_sol: 0, fees_usd: 0, sol_price: 0,
+            pnl_pct_sum: 0, leg_count: 0, minutes_held: 0, minutes_oor: 0,
+            in_range_pct: 100, close_reason: reason,
+            bin_step: res?.bin_step ?? null,
+            volatility: res?.volatility ?? null,
+            fee_tvl_ratio: res?.fee_tvl_ratio ?? null,
+          });
+        }
+        const agg = closeResultsByPool.get(p.pool);
+        agg.pnl_sol += Number(res?.pnl_sol ?? 0);
+        agg.pnl_usd += Number(res?.pnl_true_usd ?? res?.pnl_usd ?? 0);
+        agg.fees_sol += Number(res?.fees_sol ?? 0);
+        agg.sol_price = res?.sol_price ?? agg.sol_price;
+        agg.pnl_pct_sum += Number(res?.pnl_pct ?? 0);
+        agg.leg_count += 1;
+        agg.minutes_held = Math.max(agg.minutes_held, Number(res?.minutes_held ?? 0));
+        agg.minutes_oor = Math.max(agg.minutes_oor, Number(res?.minutes_oor ?? 0));
+        agg.in_range_pct = Math.min(agg.in_range_pct, Number(res?.in_range_pct ?? 100));
+        agg.bin_step = res?.bin_step ?? agg.bin_step;
+        agg.volatility = res?.volatility ?? agg.volatility;
+        agg.fee_tvl_ratio = res?.fee_tvl_ratio ?? agg.fee_tvl_ratio;
+      }
     } else if (act.action === "CLAIM") {
       await liveMessage?.toolStart("claim_fees");
       const res = await executeTool("claim_fees", { position_address: p.position }).catch(e => ({ error: e.message }));
@@ -185,6 +243,28 @@ async function executeManagementActions(actionPositions, actionMap, { liveMessag
       await liveMessage?.toolFinish("claim_fees", res, ok);
       lines.push(`${p.pair}: ${ok ? "fees claimed" : `claim FAILED — ${res?.error || res?.reason || "unknown"}`}`);
     }
+  }
+
+  // Emit ONE aggregated notifyClose per pool (hybrid → 1 notification, not 2)
+  for (const [pool, agg] of closeResultsByPool) {
+    const isHybrid = agg.leg_count > 1;
+    const avgPnlPct = agg.leg_count > 0 ? agg.pnl_pct_sum / agg.leg_count : 0;
+    notifyClose({
+      pair: isHybrid ? `${agg.pair} (hybrid ×${agg.leg_count})` : agg.pair,
+      pnl_sol: agg.pnl_sol,
+      pnl_usd: agg.pnl_usd,
+      sol_price: agg.sol_price,
+      pnl_pct: avgPnlPct,
+      fees_sol: agg.fees_sol,
+      fees_usd: agg.sol_price > 0 ? agg.fees_sol * agg.sol_price : 0,
+      minutes_held: agg.minutes_held,
+      minutes_oor: agg.minutes_oor,
+      in_range_pct: agg.in_range_pct,
+      close_reason: agg.close_reason,
+      bin_step: agg.bin_step,
+      volatility: agg.volatility,
+      fee_tvl_ratio: agg.fee_tvl_ratio,
+    }).catch(e => log("notify_warn", `Aggregated notifyClose exception: ${e.message}`));
   }
 
   // INSTRUCTION positions need the LLM to evaluate the free-text condition.
@@ -242,68 +322,118 @@ export async function runManagementCycle({ silent = false } = {}) {
       return mgmtReport;
     }
 
-    // Snapshot + load pool memory
-    const positionData = positions.map((p) => {
-      recordPositionSnapshot(p.pool, p);
-      return { ...p, recall: recallForPool(p.pool) };
+    // Build hybrid group lookup (state.js knows the pairing). 1 pool = 1 slot regardless of NFT count.
+    const stateGroups = getOpenPositionGroups();
+    const hybridGroupByAddr = new Map();
+    const groupPoolByKey = new Map();
+    for (const g of stateGroups) {
+      groupPoolByKey.set(g.key, g.pool);
+      for (const leg of g.legs) {
+        hybridGroupByAddr.set(leg.position, g.key);
+      }
+    }
+
+    // Group raw positions by hybrid_group_id (fall back to single)
+    const grouped = new Map();
+    for (const p of positions) {
+      const key = hybridGroupByAddr.get(p.position) || `single:${p.position}`;
+      if (!grouped.has(key)) grouped.set(key, []);
+      grouped.get(key).push(p);
+    }
+
+    // Snapshot + load pool memory (per group, dedup pool memory)
+    const groupData = Array.from(grouped.entries()).map(([groupKey, legs]) => {
+      const pool = legs[0].pool;
+      // Record snapshot once per pool (not per leg)
+      recordPositionSnapshot(pool, legs[0]);
+      return {
+        groupKey,
+        pool,
+        pair: legs[0].pair,
+        legs,
+        recall: recallForPool(pool),
+      };
     });
 
-    // JS exit checks. Management is the slow cron backstop: raise peak immediately
-    // (confirmTicks=1) and act on detected exits directly. Real-time 2-tick
-    // confirmation lives in the fast 3s poller below.
-    const exitMap = new Map();
-    for (const p of positionData) {
-      confirmPeak(p.position, p.pnl_pct, 1);
-      const exit = updatePnlAndCheckExits(p.position, p, config.management);
-      if (exit) {
-        exitMap.set(p.position, exit.reason);
-        log("state", `Exit alert for ${p.pair}: ${exit.reason}`);
+    // JS exit checks per LEG, but aggregate to GROUP level (any leg exits → whole group closes).
+    // updatePnlAndCheckExits needs to fire per NFT for state tracking (peak_pnl, OOR, etc).
+    const exitMap = new Map(); // groupKey → reason
+    for (const g of groupData) {
+      let groupExitReason = null;
+      for (const p of g.legs) {
+        confirmPeak(p.position, p.pnl_pct, 1);
+        const exit = updatePnlAndCheckExits(p.position, p, config.management);
+        if (exit && !groupExitReason) groupExitReason = exit.reason;
+      }
+      if (groupExitReason) {
+        exitMap.set(g.groupKey, groupExitReason);
+        log("state", `Exit alert for ${g.pair}: ${groupExitReason} (hybrid: ${g.legs.length} NFT)`);
       }
     }
 
     // ── Deterministic rule checks (no LLM) ──────────────────────────
     // action: CLOSE | CLAIM | STAY | INSTRUCTION (needs LLM)
-    const actionMap = new Map();
-    for (const p of positionData) {
+    // Hybrid: if ANY leg in group triggers CLOSE → whole group closes.
+    const actionMap = new Map(); // groupKey → { action, rule?, reason? }
+    for (const g of groupData) {
       // Hard exit — highest priority
-      if (exitMap.has(p.position)) {
-        actionMap.set(p.position, { action: "CLOSE", rule: "exit", reason: exitMap.get(p.position) });
+      if (exitMap.has(g.groupKey)) {
+        actionMap.set(g.groupKey, { action: "CLOSE", rule: "exit", reason: exitMap.get(g.groupKey) });
         continue;
       }
-      // Instruction-set — pass to LLM, can't parse in JS
-      if (p.instruction) {
-        actionMap.set(p.position, { action: "INSTRUCTION" });
+      // Instruction-set on any leg — pass to LLM
+      const instructionLeg = g.legs.find(l => l.instruction);
+      if (instructionLeg) {
+        actionMap.set(g.groupKey, { action: "INSTRUCTION", instruction: instructionLeg.instruction, leg: instructionLeg });
         continue;
       }
-
-      const closeRule = getDeterministicCloseRule(p, config.management);
-      if (closeRule) {
-        actionMap.set(p.position, closeRule);
+      // Close rule on any leg (whole group closes)
+      let groupClose = null;
+      for (const p of g.legs) {
+        const r = getDeterministicCloseRule(p, config.management);
+        if (r && !groupClose) groupClose = r;
+      }
+      if (groupClose) {
+        actionMap.set(g.groupKey, groupClose);
         continue;
       }
-      // Claim rule
-      if ((p.unclaimed_fees_usd ?? 0) >= config.management.minClaimAmount) {
-        actionMap.set(p.position, { action: "CLAIM" });
+      // Claim — claim each leg with claimable fees
+      const totalUnclaimed = g.legs.reduce((s, l) => s + (l.unclaimed_fees_usd ?? 0), 0);
+      if (totalUnclaimed >= config.management.minClaimAmount) {
+        actionMap.set(g.groupKey, { action: "CLAIM", legs: g.legs });
         continue;
       }
-      actionMap.set(p.position, { action: "STAY" });
+      actionMap.set(g.groupKey, { action: "STAY" });
     }
 
-    // ── Build JS report ──────────────────────────────────────────────
-    const totalValue = positionData.reduce((s, p) => s + (p.total_value_usd ?? 0), 0);
-    const totalUnclaimed = positionData.reduce((s, p) => s + (p.unclaimed_fees_usd ?? 0), 0);
+    // ── Build JS report (per GROUP, not per leg) ─────────────────────
+    const totalValue = groupData.reduce((s, g) => s + g.legs.reduce((ss, l) => ss + (l.total_value_usd ?? 0), 0), 0);
+    const totalUnclaimed = groupData.reduce((s, g) => s + g.legs.reduce((ss, l) => ss + (l.unclaimed_fees_usd ?? 0), 0), 0);
+    const slotCount = groupData.length;
 
-    const reportLines = positionData.map((p) => {
-      const act = actionMap.get(p.position);
-      const inRange = p.in_range ? "🟢 IN" : `🔴 OOR ${p.minutes_out_of_range ?? 0}m`;
-      const val = config.management.solMode ? `◎${p.total_value_usd ?? "?"}` : `$${p.total_value_usd ?? "?"}`;
-      const unclaimed = config.management.solMode ? `◎${p.unclaimed_fees_usd ?? "?"}` : `$${p.unclaimed_fees_usd ?? "?"}`;
+    const reportLines = groupData.map((g) => {
+      const act = actionMap.get(g.groupKey);
+      const isHybrid = g.legs.length > 1;
+      // Aggregate group health: any leg OOR → group OOR
+      const anyOor = g.legs.some(l => !l.in_range);
+      const maxOor = Math.max(...g.legs.map(l => Number(l.minutes_out_of_range ?? 0)));
+      const inRange = anyOor ? `🔴 OOR ${maxOor}m` : "🟢 IN";
+      const totalVal = g.legs.reduce((s, l) => s + Number(l.total_value_usd ?? 0), 0);
+      const totalUncl = g.legs.reduce((s, l) => s + Number(l.unclaimed_fees_usd ?? 0), 0);
+      const ageMins = g.legs[0]?.age_minutes ?? "?";
+      const avgPnlPct = g.legs.reduce((s, l) => s + Number(l.pnl_pct ?? 0), 0) / g.legs.length;
+      const avgFeeTvl = g.legs
+        .map(l => l.fee_per_tvl_24h)
+        .filter(v => v != null)
+        .reduce((s, v, _, arr) => s + v / arr.length, 0);
+      const val = config.management.solMode ? `◎${totalVal.toFixed(4)}` : `$${totalVal.toFixed(4)}`;
+      const uncl = config.management.solMode ? `◎${totalUncl.toFixed(4)}` : `$${totalUncl.toFixed(4)}`;
       const statusLabel = act.action === "INSTRUCTION" ? "HOLD (instruction)" : act.action;
-      let line = `**${p.pair}** | Age: ${p.age_minutes ?? "?"}m | Val: ${val} | Unclaimed: ${unclaimed} | PnL: ${p.pnl_pct ?? "?"}% | Yield: ${p.fee_per_tvl_24h ?? "?"}% | ${inRange} | ${statusLabel}`;
-      if (p.instruction) line += `\nNote: "${p.instruction}"`;
+      let line = `**${g.pair}**${isHybrid ? ` (×${g.legs.length})` : ""} | Age: ${ageMins}m | Val: ${val} | Unclaimed: ${uncl} | PnL: ${avgPnlPct.toFixed(2)}% | Yield: ${Number.isFinite(avgFeeTvl) ? avgFeeTvl.toFixed(2) : "?"}% | ${inRange} | ${statusLabel}`;
+      if (act.action === "INSTRUCTION" && act.instruction) line += `\nNote: "${act.instruction}"`;
       if (act.action === "CLOSE" && act.rule === "exit") line += `\n⚡ Trailing TP: ${act.reason}`;
       if (act.action === "CLOSE" && act.rule && act.rule !== "exit") line += `\nRule ${act.rule}: ${act.reason}`;
-      if (act.action === "CLAIM") line += `\n→ Claiming fees`;
+      if (act.action === "CLAIM") line += `\n→ Claiming fees on ${act.legs.length} NFT(s)`;
       return line;
     });
 
@@ -314,27 +444,38 @@ export async function runManagementCycle({ silent = false } = {}) {
 
     const cur = config.management.solMode ? "◎" : "$";
     mgmtReport = reportLines.join("\n\n") +
-      `\n\nSummary: 💼 ${positions.length} positions | ${cur}${totalValue.toFixed(4)} | fees: ${cur}${totalUnclaimed.toFixed(4)} | ${actionSummary}`;
+      `\n\nSummary: 💼 ${slotCount} pool${slotCount === 1 ? "" : "s"} (${positions.length} NFT${positions.length === 1 ? "" : "s"}) | ${cur}${totalValue.toFixed(4)} | fees: ${cur}${totalUnclaimed.toFixed(4)} | ${actionSummary}`;
 
     // ── Call LLM only if action needed ──────────────────────────────
-    const actionPositions = positionData.filter(p => {
-      const a = actionMap.get(p.position);
+    const actionGroups = groupData.filter(g => {
+      const a = actionMap.get(g.groupKey);
       return a.action !== "STAY";
     });
 
-    if (actionPositions.length > 0) {
-      const execReport = await executeManagementActions(actionPositions, actionMap, { liveMessage, cur });
+    if (actionGroups.length > 0) {
+      // Flatten action groups back to position array (for executor compat)
+      const actionPositions = actionGroups.flatMap(g => g.legs);
+      // executeManagementActions expects actionMap keyed by position address.
+      // Our group-keyed map has groupKey → action; expand to per-position entries.
+      const positionKeyedActionMap = new Map();
+      for (const g of actionGroups) {
+        const act = actionMap.get(g.groupKey);
+        for (const p of g.legs) {
+          positionKeyedActionMap.set(p.position, act);
+        }
+      }
+      const execReport = await executeManagementActions(actionPositions, positionKeyedActionMap, { liveMessage, cur });
       if (execReport) mgmtReport += `\n\n${execReport}`;
     } else {
       log("cron", "Management: all positions STAY — skipping");
       await liveMessage?.note("No tool actions needed.");
     }
 
-    // Trigger screening after management
+    // Trigger screening after management — use slot count, not NFT count
     const afterPositions = await getMyPositions({ force: true }).catch(() => null);
-    const afterCount = afterPositions?.positions?.length ?? 0;
-    if (afterCount < config.risk.maxPositions && Date.now() - _screeningLastTriggered > screeningCooldownMs) {
-      log("cron", `Post-management: ${afterCount}/${config.risk.maxPositions} positions — triggering screening`);
+    const afterSlots = getOpenSlotCount();
+    if (afterSlots < config.risk.maxPositions && Date.now() - _screeningLastTriggered > screeningCooldownMs) {
+      log("cron", `Post-management: ${afterSlots}/${config.risk.maxPositions} pool-slots — triggering screening`);
       runScreeningCycle().catch((e) => log("cron_error", `Triggered screening failed: ${e.message}`));
     }
   } catch (error) {
@@ -347,9 +488,14 @@ export async function runManagementCycle({ silent = false } = {}) {
         if (liveMessage) await liveMessage.finalize(stripThink(mgmtReport)).catch(() => {});
         else sendMessage(`🔄 Management Cycle\n\n${stripThink(mgmtReport)}`).catch(() => { });
       }
+      // OOR notify — per pool (not per NFT) so we don't double-notify hybrid
+      const oorPoolsNotified = new Set();
       for (const p of positions) {
         if (!p.in_range && p.minutes_out_of_range >= config.management.outOfRangeWaitMinutes) {
-          notifyOutOfRange({ pair: p.pair, minutesOOR: p.minutes_out_of_range }).catch(() => { });
+          if (!oorPoolsNotified.has(p.pool)) {
+            notifyOutOfRange({ pair: p.pair, minutesOOR: p.minutes_out_of_range }).catch(() => { });
+            oorPoolsNotified.add(p.pool);
+          }
         }
       }
     }
@@ -365,21 +511,39 @@ export async function runScreeningCycle({ silent = false } = {}) {
   _screeningBusy = true; // set immediately — prevents TOCTOU race with concurrent callers
   _screeningLastTriggered = Date.now();
 
+  // Watchdog: force-release busy lock after 5min in case agent hangs (LLM/RPC/Telegram timeout)
+  const _screeningWatchdog = setTimeout(() => {
+    if (_screeningBusy) {
+      log("cron_warn", "Screening cycle exceeded 5min — forcing _screeningBusy=false to unblock next cycle");
+      _screeningBusy = false;
+    }
+  }, 5 * 60 * 1000);
+
   // Hard guards — don't even run the agent if preconditions aren't met
   let prePositions, preBalance;
   let liveMessage = null;
   let screenReport = null;
   try {
     [prePositions, preBalance] = await Promise.all([getMyPositions({ force: true }), getWalletBalances()]);
-    if (prePositions.total_positions >= config.risk.maxPositions) {
-      log("cron", `Screening skipped — max positions reached (${prePositions.total_positions}/${config.risk.maxPositions})`);
-      screenReport = `Screening skipped — max positions reached (${prePositions.total_positions}/${config.risk.maxPositions}).`;
+    // Reclaim ghost slots BEFORE slot check — state entries without on-chain NFT get auto-closed here,
+    // so the slot counter reflects real on-chain positions (not stale state from failed Phase 2, premature closes, etc.)
+    try {
+      syncOpenPositions((prePositions.positions || []).map((p) => p.position).filter(Boolean));
+    } catch (e) {
+      log("cron_warn", `Pre-screening ghost reclaim skipped: ${e.message}`);
+    }
+    // Slot check: 1 hybrid pool = 1 slot (not 2 NFTs). Use state-based slot count.
+    const openSlots = getOpenSlotCount();
+    if (openSlots >= config.risk.maxPositions) {
+      log("cron", `Screening skipped — max pool-slots reached (${openSlots}/${config.risk.maxPositions}, ${prePositions.total_positions} NFTs)`);
+      screenReport = `Screening skipped — max pool-slots reached (${openSlots}/${config.risk.maxPositions}, ${prePositions.total_positions} NFTs).`;
       appendDecision({
         type: "skip",
         actor: "SCREENER",
         summary: "Screening skipped",
-        reason: `Max positions reached (${prePositions.total_positions}/${config.risk.maxPositions})`,
+        reason: `Max pool-slots reached (${openSlots}/${config.risk.maxPositions}, ${prePositions.total_positions} NFTs)`,
       });
+      clearTimeout(_screeningWatchdog);
       _screeningBusy = false;
       return screenReport;
     }
@@ -394,16 +558,21 @@ export async function runScreeningCycle({ silent = false } = {}) {
         summary: "Screening skipped",
         reason: `Insufficient SOL (${preBalance.sol.toFixed(3)} < ${minRequired})`,
       });
+      clearTimeout(_screeningWatchdog);
       _screeningBusy = false;
       return screenReport;
     }
   } catch (e) {
     log("cron_error", `Screening pre-check failed: ${e.message}`);
     screenReport = `Screening pre-check failed: ${e.message}`;
+    clearTimeout(_screeningWatchdog);
     _screeningBusy = false;
     return screenReport;
   }
-  if (!silent && telegramEnabled()) {
+  // Live message disabled for screening cycle — tool-line stream eats the 4096-char
+  // Telegram limit and clips the LLM's structured 🚀 DEPLOYED footer. Send the LLM's
+  // full report as a standalone message instead. Re-enable here to restore streaming.
+  if (false && !silent && telegramEnabled()) {
     liveMessage = await createLiveMessage("🔍 Screening Cycle", "Scanning candidates...");
   }
   timers.screeningLastRun = Date.now();
@@ -462,6 +631,13 @@ export async function runScreeningCycle({ silent = false } = {}) {
       if (botPct != null && maxBotHoldersPct != null && botPct > maxBotHoldersPct) {
         log("screening", `Bot-holder filter: dropped ${pool.name} — bots ${botPct}% > ${maxBotHoldersPct}%`);
         filteredOut.push({ name: pool.name, reason: `bot holders ${botPct}% > ${maxBotHoldersPct}%` });
+        return false;
+      }
+      const top10Pct = ti?.audit?.top_holders_pct;
+      const maxTop10Pct = config.screening.maxTop10Pct;
+      if (top10Pct != null && maxTop10Pct != null && Number(top10Pct) > Number(maxTop10Pct)) {
+        log("screening", `Top10 filter: dropped ${pool.name} — top10 ${top10Pct}% > ${maxTop10Pct}%`);
+        filteredOut.push({ name: pool.name, reason: `top10 ${top10Pct}% > ${maxTop10Pct}%` });
         return false;
       }
       return true;
@@ -537,11 +713,15 @@ export async function runScreeningCycle({ silent = false } = {}) {
       const block = [
         `POOL: ${pool.name} (${pool.pool})`,
         `  metrics: bin_step=${pool.bin_step}, fee_pct=${pool.fee_pct}%, fee_tvl=${pool.fee_active_tvl_ratio}, vol=$${pool.volume_window}, tvl=$${pool.tvl ?? pool.active_tvl}, volatility_${pool.volatility_timeframe || "30m"}=${pool.volatility}, mcap=$${pool.mcap}, organic=${pool.organic_score}${pool.token_age_hours != null ? `, age=${pool.token_age_hours}h` : ""}`,
+        `  coverage_bins_below: ${pool.computed_bins_below != null ? `${pool.computed_bins_below} (USE THIS — coverage formula is PRIMARY; Formula A is disabled)` : `null (SKIP candidate — no coverage data, Formula A is disabled)`}`,
         `  audit: top10=${top10Pct}%, bots=${botPct}%, fees=${feesSol}SOL${launchpad ? `, launchpad=${launchpad}` : ""}`,
         pvpLine,
         `  smart_wallets: ${sw?.in_pool?.length ?? 0} present${sw?.in_pool?.length ? ` → CONFIDENCE BOOST (${sw.in_pool.map(w => w.name).join(", ")})` : ""}`,
         activeBin != null ? `  active_bin: ${activeBin}` : null,
         priceChange != null ? `  1h: price${priceChange >= 0 ? "+" : ""}${priceChange}%, net_buyers=${netBuyers ?? "?"}` : null,
+        pool.price_change_pct != null ? `  30m_price_change: ${pool.price_change_pct >= 0 ? "+" : ""}${pool.price_change_pct}%` : null,
+        pool.indicator_confirmation?.signal?.rsi != null ? `  15m_rsi: ${pool.indicator_confirmation.signal.rsi.toFixed(1)}` : null,
+        pool.suggested_strategy ? `  suggested_strategy: ${pool.suggested_strategy}` : null,
         n?.narrative ? `  narrative_untrusted: ${sanitizeUntrustedPromptText(n.narrative, 500)}` : `  narrative_untrusted: none`,
         mem ? `  memory_untrusted: ${sanitizeUntrustedPromptText(mem, 500)}` : null,
       ].filter(Boolean).join("\n");
@@ -572,7 +752,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
     const { content } = await agentLoop(`
 SCREENING CYCLE
 ${strategyBlock}
-Positions: ${prePositions.total_positions}/${config.risk.maxPositions} | SOL: ${currentBalance.sol.toFixed(3)} | Deploy: ${deployAmount} SOL
+Positions: ${getOpenSlotCount()}/${config.risk.maxPositions} (${prePositions.total_positions} NFTs) | SOL: ${currentBalance.sol.toFixed(3)} | Deploy: ${deployAmount} SOL
 
 PRE-LOADED CANDIDATES (${passing.length} pools):
 ${candidateBlocks.join("\n\n")}
@@ -581,7 +761,7 @@ STEPS:
 1. Decide if any candidate is actually worth deploying. One surviving candidate is not automatically good enough.
 2. Pick the best candidate based on narrative quality, smart wallets, and pool metrics.
 3. Call deploy_position (active_bin is pre-fetched above — no need to call get_active_bin).
-   bins_below = round(${config.strategy.minBinsBelow} + (candidate volatility/5)*(${config.strategy.maxBinsBelow - config.strategy.minBinsBelow})) clamped to [${config.strategy.minBinsBelow},${config.strategy.maxBinsBelow}].
+   BINS_BELOW: USE candidate.coverage_bins_below EXACTLY as rendered in the candidate block (coverage formula is PRIMARY, Formula A is DISABLED — executor enforces this). DO NOT compute bins_below from volatility. If coverage_bins_below says "null (SKIP)", then SKIP that candidate — do not deploy_position.
    pass deploy_position.volatility = the candidate volatility value.
    For single-side SOL deploys, do not invent upside:
    set amount_y only, keep amount_x = 0, keep bins_above = 0, and let the upper bin stay at the active bin.
@@ -591,7 +771,7 @@ STEPS:
    <pool name>
    <pool address>
 
-   ◎ <deploy amount> SOL | <strategy> | bin <active_bin>
+   ◎ <deploy amount> SOL | <strategy> | <bins_below> bins below active (range: <lower_bin> → <active_bin>)
    Range: <minPrice> → <maxPrice>
    Range cover: <downside %> downside | <upside %> upside | <total width %> total
 
@@ -662,11 +842,17 @@ IMPORTANT:
         summary: deployAttempted ? "Deploy attempt did not succeed" : "No successful deploy in screening cycle",
         reason: stripThink(content).slice(0, 500),
       });
+      // Defensive override: when deploy_position failed but LLM emitted "🚀 DEPLOYED" text,
+      // append a clear failure notice so the cycle report doesn't claim success.
+      if (deployAttempted) {
+        screenReport = `${content}\n\n⚠️ DEPLOY_FAILED\nThe deploy_position tool returned success=false. Position was NOT created on-chain despite the "🚀 DEPLOYED" header above. recoverFromDeployFailure has scanned state and wallet for stranded tokens.`;
+      }
     }
   } catch (error) {
     log("cron_error", `Screening cycle failed: ${error.message}`);
     screenReport = `Screening cycle failed: ${error.message}`;
   } finally {
+    clearTimeout(_screeningWatchdog);
     _screeningBusy = false;
     if (!silent && telegramEnabled()) {
       if (screenReport) {
@@ -782,7 +968,7 @@ Summarize the current portfolio health, total fees earned, and performance of al
           getMyPositions({ force: true, silent: true }).catch(() => null),
           getWalletBalances().catch(() => null),
         ]);
-        if (!positions || (positions.total_positions ?? 0) >= config.risk.maxPositions) return;
+        if (!positions || getOpenSlotCount() >= config.risk.maxPositions) return;
         const minRequired = config.management.deployAmountSol + config.management.gasReserve;
         if (process.env.DRY_RUN !== "true" && (!balance || balance.sol < minRequired)) return;
 
@@ -865,7 +1051,7 @@ async function shutdown(signal) {
     5000
   );
   if (positions) {
-    log("shutdown", `Open positions at shutdown: ${positions.total_positions}`);
+    log("shutdown", `Open positions at shutdown: ${getOpenSlotCount()} pool-slots (${positions.total_positions} NFTs)`);
   } else {
     log("shutdown", "Open position snapshot skipped during shutdown timeout");
   }
@@ -899,6 +1085,14 @@ function formatCandidates(candidates) {
 
 function getDeterministicCloseRule(position, managementConfig) {
   const tracked = getTrackedPosition(position.position);
+  // Minimum hold time guard — same as updatePnlAndCheckExits. Blocks RULE_1-5
+  // exits (stop loss, take profit, pumped above, OOR, low yield) for the first
+  // N minutes after deploy. Prevents 27-second ghost exits.
+  const minHoldMs = Math.max(0, Number(managementConfig?.minHoldTimeMinutes ?? 0)) * 60 * 1000;
+  if (minHoldMs > 0 && tracked?.deployed_at) {
+    const ageMs = Date.now() - new Date(tracked.deployed_at).getTime();
+    if (ageMs < minHoldMs) return null;
+  }
   const pnlSuspect = (() => {
     // Couldn't-price-this-tick flag (e.g. Jupiter outage) — never act on PnL rules.
     if (position.pnl_pct_suspicious) return true;
@@ -911,8 +1105,8 @@ function getDeterministicCloseRule(position, managementConfig) {
     return false;
   })();
 
-  if (!pnlSuspect && position.pnl_pct != null && position.pnl_pct <= managementConfig.stopLossPct) {
-    return { action: "CLOSE", rule: 1, reason: "stop loss" };
+  if (!pnlSuspect && position.out_of_range_since && position.pnl_pct != null && position.pnl_pct <= managementConfig.stopLossPct) {
+    return { action: "CLOSE", rule: 1, reason: "stop loss (OOR)" };
   }
   if (!pnlSuspect && position.pnl_pct != null && position.pnl_pct >= managementConfig.takeProfitPct) {
     return { action: "CLOSE", rule: 2, reason: "take profit" };
@@ -984,10 +1178,14 @@ function describeLatestCandidates(limit = 5) {
 function formatWalletStatus(wallet, positions) {
   const deployAmount = computeDeployAmount(wallet.sol);
   const hive = isHiveMindEnabled() ? "on" : "off";
+  // Slot count: 1 hybrid pool = 1 slot, not 2 NFTs. Use state for grouping.
+  const slotCount = getOpenSlotCount();
+  const nftCount = positions.total_positions ?? positions.positions?.length ?? 0;
+  const slotSuffix = nftCount !== slotCount ? ` (${nftCount} NFT${nftCount === 1 ? "" : "s"})` : "";
   return [
     `Wallet: ${wallet.sol} SOL ($${wallet.sol_usd})`,
     `SOL price: $${wallet.sol_price}`,
-    `Open positions: ${positions.total_positions}/${config.risk.maxPositions}`,
+    `Open positions: ${slotCount}/${config.risk.maxPositions}${slotSuffix}`,
     `Next deploy amount: ${deployAmount} SOL`,
     `Dry run: ${process.env.DRY_RUN === "true" ? "yes" : "no"}`,
     `HiveMind: ${hive}`,
@@ -1004,6 +1202,7 @@ function formatConfigSnapshot() {
     `Trailing: ${config.management.trailingTakeProfit ? "on" : "off"} | trigger ${config.management.trailingTriggerPct}% | drop ${config.management.trailingDropPct}%`,
     `OOR: ${config.management.outOfRangeWaitMinutes}m | cooldown ${config.management.oorCooldownTriggerCount}x / ${config.management.oorCooldownHours}h`,
     `Repeat deploy cooldown: ${config.management.repeatDeployCooldownEnabled ? "on" : "off"} | ${config.management.repeatDeployCooldownTriggerCount}x / ${config.management.repeatDeployCooldownHours}h | min fee earned ${config.management.repeatDeployCooldownMinFeeEarnedPct}% | ${config.management.repeatDeployCooldownScope}`,
+    `Loss cooldown: ${config.management.lossCooldownEnabled ? "on" : "off"} | ${config.management.lossCooldownHours}h | min loss ${config.management.lossCooldownMinLossPct}% | ${config.management.lossCooldownScope}`,
     `Yield floor: ${config.management.minFeePerTvl24h}% | min age ${config.management.minAgeBeforeYieldCheck}m`,
     `Screening: ${config.screening.category} / ${config.screening.timeframe} | TVL ${config.screening.minTvl}-${config.screening.maxTvl}`,
     `Intervals: manage ${config.schedule.managementIntervalMin}m | screen ${config.schedule.screeningIntervalMin}m`,
@@ -1450,13 +1649,111 @@ async function telegramHandler(msg) {
       const { positions, total_positions } = await getMyPositions({ force: true });
       if (total_positions === 0) { await sendMessage("No open positions."); return; }
       const cur = config.management.solMode ? "◎" : "$";
-      const lines = positions.map((p, i) => {
-        const pnl = p.pnl_usd >= 0 ? `+${cur}${p.pnl_usd}` : `-${cur}${Math.abs(p.pnl_usd)}`;
-        const age = p.age_minutes != null ? `${p.age_minutes}m` : "?";
-        const oor = !p.in_range ? " ⚠️OOR" : "";
-        return `${i + 1}. ${p.pair} | ${cur}${p.total_value_usd} | PnL: ${pnl} | fees: ${cur}${p.unclaimed_fees_usd} | ${age}${oor}`;
+
+      // Build state position map for hybrid_group_id lookup (position address → tracked)
+      const stateGroups = getOpenPositionGroups();
+      const hybridGroupByAddr = new Map();
+      const hybridGroupKeyByAddr = new Map();
+      for (const g of stateGroups) {
+        if (!g.is_hybrid) continue;
+        const groupKey = g.key; // e.g. hybrid_Bokz38VN_172...
+        for (const leg of g.legs) {
+          hybridGroupByAddr.set(leg.position, groupKey);
+          hybridGroupKeyByAddr.set(leg.position, groupKey);
+        }
+      }
+
+      // Group raw positions by hybrid_group_id (fall back to position address for singles)
+      const grouped = new Map();
+      for (const p of positions) {
+        const key = hybridGroupByAddr.get(p.position) || `single:${p.position}`;
+        if (!grouped.has(key)) grouped.set(key, []);
+        grouped.get(key).push(p);
+      }
+
+      const flatArr = Array.from(grouped.entries());
+      const blocks = flatArr.map(([groupKey, legs], i) => {
+        const isHybrid = legs.length > 1 && !groupKey.startsWith("single:");
+        const totalValue = legs.reduce((s, l) => s + Number(l.total_value_usd ?? 0), 0);
+        const totalPnl = legs.reduce((s, l) => s + Number(l.pnl_usd ?? 0), 0);
+        const totalFees = legs.reduce((s, l) => s + Number(l.unclaimed_fees_usd ?? 0), 0);
+        const avgPnlPct = legs.length > 0
+          ? legs.reduce((s, l) => s + Number(l.pnl_pct ?? 0), 0) / legs.length
+          : 0;
+        const pnlSign = totalPnl >= 0 ? "+" : "-";
+        const pnlEmoji = totalPnl >= 0 ? "🟢" : "🔴";
+
+        // Aggregate health flags across legs
+        const anyOor = legs.some(l => !l.in_range);
+        const maxOorMins = Math.max(...legs.map(l => Number(l.minutes_out_of_range ?? 0)));
+        const ageMins = legs[0]?.age_minutes ?? null;
+        const ageEmoji = anyOor ? "🔴" : "🟢";
+        const ageStr = ageMins != null ? `${ageMins}m` : "?";
+
+        // Average fee/TVL across legs
+        const feeTvlVals = legs.map(l => l.fee_per_tvl_24h).filter(v => v != null);
+        const avgFeeTvl = feeTvlVals.length > 0 ? feeTvlVals.reduce((s,v)=>s+v,0) / feeTvlVals.length : null;
+
+        // Range coverage: show min/max bin across all legs (single-side SOL all share same range)
+        const lowerBins = legs.map(l => l.lower_bin).filter(v => v != null);
+        const upperBins = legs.map(l => l.upper_bin).filter(v => v != null);
+        const activeBins = legs.map(l => l.active_bin).filter(v => v != null);
+        const minBin = lowerBins.length > 0 ? Math.min(...lowerBins) : null;
+        const maxBin = upperBins.length > 0 ? Math.max(...upperBins) : null;
+        const lastActive = activeBins.length > 0 ? activeBins[activeBins.length - 1] : null;
+
+        let progressBar = "[············] 0%";
+        if (minBin != null && maxBin != null && lastActive != null) {
+          const totalBins = maxBin - minBin;
+          const fromLower = lastActive - minBin;
+          const pct = totalBins > 0 ? Math.max(0, Math.min(100, Math.round((fromLower / totalBins) * 100))) : 0;
+          const filled = Math.round(pct / 10);
+          const empty = 10 - filled;
+          progressBar = `[${"█".repeat(filled)}${"·".repeat(empty)}] ${pct}%`;
+        }
+        const binInfo = (minBin != null && maxBin != null && lastActive != null)
+          ? `🏦 Bin: ${minBin} ← ${lastActive} → ${maxBin}`
+          : "🏦 Bin: ?";
+        const feeTvlLine = avgFeeTvl != null ? `🔥 24h fee/TVL: ${avgFeeTvl.toFixed(2)}%` : null;
+        const oorLine = anyOor ? `⚠️ OOR ${maxOorMins}m` : null;
+
+        const pairLabel = legs[0]?.pair ?? "?";
+        const strategyTag = isHybrid ? "hybrid" : (legs[0]?.strategy ?? "spot");
+        const line1 = `${i + 1}. 💵 ${pairLabel} | ${cur}${totalValue.toFixed(4)}${isHybrid ? ` (×${legs.length})` : ""}`;
+        const line2 = `   ${pnlEmoji} ${pnlSign}${Math.abs(avgPnlPct).toFixed(2)}% (${pnlSign}${cur}${Math.abs(totalPnl).toFixed(4)}) | fees: ${cur}${totalFees.toFixed(4)} | ${ageEmoji} ${ageStr}`;
+        const line3 = `   📊 Position: ${progressBar}`;
+        const line4 = `   ${binInfo}`;
+        // Build role lookup from state: NFT address → hybrid_role
+        const roleByAddr = new Map();
+        for (const g of stateGroups) {
+          if (!g.is_hybrid) continue;
+          for (const leg of g.legs) {
+            roleByAddr.set(leg.position, leg.hybrid_role);
+          }
+        }
+
+        // Hybrid sub-breakdown: show each NFT with its amount + role (from state, not RPC order)
+        const legLines = isHybrid
+          ? legs.map((l) => {
+              const lv = Number(l.total_value_usd ?? 0);
+              const lp = Number(l.pnl_usd ?? 0);
+              const lf = Number(l.unclaimed_fees_usd ?? 0);
+              const ls = `${lp >= 0 ? "+" : "-"}${cur}${Math.abs(lp).toFixed(4)}`;
+              const lfs = `${cur}${lf.toFixed(4)}`;
+              // Role from state lookup (authoritative); fall back to display sort if missing
+              const roleTag = roleByAddr.get(l.position) || (lv < totalValue / legs.length ? "spot" : "bid_ask");
+              return `      ├─ ${roleTag} ${cur}${lv.toFixed(4)} | PnL ${ls} | fees ${lfs}`;
+            })
+          : [];
+        const extras = [oorLine, feeTvlLine, ...legLines].filter(Boolean).join("\n   ");
+        const stratLine = isHybrid ? `   🧬 Strategy: ${strategyTag}` : "";
+        return [line1, line2, stratLine, line3, line4, extras].filter(Boolean).join("\n");
       });
-      await sendMessage(`📊 Open Positions (${total_positions}):\n\n${lines.join("\n")}\n\n/close <n> to close | /set <n> <note> to set instruction`);
+
+      // Header count: pool-slots, not raw NFTs
+      const slotCount = stateGroups.length;
+      const slotLabel = stateGroups.length === 1 ? "position" : "positions";
+      await sendMessage(`📊 Open Positions (${slotCount} ${slotLabel}, ${total_positions} NFT${total_positions === 1 ? "" : "s"}):\n\n${blocks.join("\n\n")}\n\n/close <n> to close | /set <n> <note> to set instruction`);
     } catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => {}); }
     return;
   }
@@ -1484,7 +1781,31 @@ async function telegramHandler(msg) {
     return;
   }
 
-  const closeMatch = text.match(/^\/close\s+(\d+)$/i);
+  // ─── Auto-swap base token to SOL after manual close ─────────
+// Mirrors executor.js:660-675 logic so /close and /closeall behave the same as
+// agent-driven close_position. Skips when baseMint missing/SOL, balance below
+// $0.10, or Jupiter swap fails (warn-only, never blocks close notif).
+async function autoSwapBaseToSol(baseMint) {
+  if (!baseMint) return null;
+  if (baseMint === config.tokens.SOL) return null;
+  try {
+    const balances = await getWalletBalances({});
+    const token = balances.tokens?.find((t) => t.mint === baseMint);
+    if (!token || !token.usd || token.usd < 0.10) return null;
+    const sym = token.symbol || baseMint.slice(0, 8);
+    log("auto_swap", `Manual close → auto-swapping ${sym} ($${token.usd.toFixed(2)}) → SOL`);
+    const swapResult = await swapToken({ input_mint: baseMint, output_mint: "SOL", amount: token.balance });
+    if (swapResult?.amount_out) {
+      return `🔁 auto-swapped ${sym} → ${swapResult.amount_out.toFixed(4)} SOL`;
+    }
+    return `🔁 auto-swap attempted for ${sym} (no amount_out returned)`;
+  } catch (e) {
+    log("auto_swap_warn", `Auto-swap after manual close failed: ${e.message}`);
+    return `⚠️ auto-swap failed: ${e.message}`;
+  }
+}
+
+const closeMatch = text.match(/^\/close\s+(\d+)$/i);
   if (closeMatch) {
     try {
       const idx = parseInt(closeMatch[1]) - 1;
@@ -1494,9 +1815,29 @@ async function telegramHandler(msg) {
       await sendMessage(`Closing ${pos.pair}...`);
       const result = await closePosition({ position_address: pos.position });
       if (result.success) {
+        // Rich close notification via notifyClose (3-retry built in).
+        // Use result.pnl_sol directly (Meteora's SOL-denominated PnlL at close time)
+        // — do NOT recompute via pnl_true_usd/sol_price; that flips sign when USD PnL is
+        // negative but SOL position actually gained (e.g. SOL price dropped during LP).
+        await notifyClose({
+          pair: pos.pair || result.pool_name || "Unknown",
+          pnl_sol: result.pnl_sol ?? 0,
+          pnl_usd: result.pnl_true_usd ?? result.pnl_usd ?? 0,
+          pnl_pct: result.pnl_pct ?? 0,
+          fees_sol: result.fees_sol ?? 0,
+          minutes_held: result.minutes_held ?? pos.age_minutes ?? 0,
+          minutes_oor: pos.minutes_out_of_range ?? 0,
+          in_range_pct: pos.in_range_pct ?? 100,
+          close_reason: "manual /close command",
+          bin_step: pos.bin_step ?? null,
+          volatility: pos.volatility ?? null,
+          fee_tvl_ratio: pos.fee_tvl_ratio ?? null,
+          sol_price: result.sol_price ?? pos.sol_price ?? 0,
+        });
         const closeTxs = result.close_txs?.length ? result.close_txs : result.txs;
         const claimNote = result.claim_txs?.length ? `\nClaim txs: ${result.claim_txs.join(", ")}` : "";
-        await sendMessage(`✅ Closed ${pos.pair}\nPnL: ${config.management.solMode ? "◎" : "$"}${result.pnl_usd ?? "?"} | close txs: ${closeTxs?.join(", ") || "n/a"}${claimNote}`);
+        const swapStatus = await autoSwapBaseToSol(result.base_mint);
+        await sendMessage(`✅ Closed ${pos.pair}\nPnL: ${config.management.solMode ? "◎" : "$"}${result.pnl_usd ?? "?"} | close txs: ${closeTxs?.join(", ") || "n/a"}${claimNote}${swapStatus ? `\n${swapStatus}` : ""}`);
       } else {
         await sendMessage(`❌ Close failed: ${JSON.stringify(result)}`);
       }
@@ -1512,8 +1853,34 @@ async function telegramHandler(msg) {
       const results = [];
       for (const pos of positions) {
         try {
+          let swapNote = "";
           const result = await closePosition({ position_address: pos.position });
-          results.push(`${pos.pair}: ${result.success ? "closed" : `failed (${result.error || "unknown"})`}`);
+          if (result.success) {
+            // Rich close notification per position (mirrors /close manual).
+            // Use result.pnl_sol directly (Meteora's SOL-denominated PnL at close time)
+            // — do NOT recompute via pnl_true_usd/sol_price; that flips sign when USD PnL
+            // is negative but SOL position actually gained.
+            await notifyClose({
+              pair: pos.pair || result.pool_name || "Unknown",
+              pnl_sol: result.pnl_sol ?? 0,
+              pnl_usd: result.pnl_true_usd ?? result.pnl_usd ?? 0,
+              pnl_pct: result.pnl_pct ?? 0,
+              fees_sol: result.fees_sol ?? 0,
+              minutes_held: result.minutes_held ?? pos.age_minutes ?? 0,
+              minutes_oor: pos.minutes_out_of_range ?? 0,
+              in_range_pct: pos.in_range_pct ?? 100,
+              close_reason: "manual /closeall command",
+              bin_step: pos.bin_step ?? null,
+              volatility: pos.volatility ?? null,
+              fee_tvl_ratio: pos.fee_tvl_ratio ?? null,
+            });
+            const swapStatus = await autoSwapBaseToSol(result.base_mint);
+            if (swapStatus) swapNote = ` ${swapStatus}`;
+          }
+          const closeTxs = result.close_txs?.length ? result.close_txs : result.txs;
+          const txShort = closeTxs?.[0] ? closeTxs[0].slice(0, 8) : "n/a";
+          const claimNote = result.claim_txs?.length ? ` (claim: ${result.claim_txs.join(", ")})` : "";
+          results.push(`${pos.pair}: ${result.success ? `closed (tx: ${txShort})${claimNote}${swapNote}` : `failed (${result.error || "unknown"})`}`);
         } catch (error) {
           results.push(`${pos.pair}: failed (${error.message})`);
         }
@@ -1694,7 +2061,10 @@ function getLoneCandidateSkipReason({ pool, sw, n, ti } = {}) {
   if (Number.isFinite(globalFeesSol) && globalFeesSol < config.screening.minTokenFeesSol) {
     return `token fees ${globalFeesSol} SOL below minimum ${config.screening.minTokenFeesSol} SOL`;
   }
-  if (Number.isFinite(top10Pct) && top10Pct > config.screening.maxTop10Pct) {
+  if (!Number.isFinite(top10Pct)) {
+    return `top10 concentration unknown (no audit data) — gate requires data; max ${config.screening.maxTop10Pct}%`;
+  }
+  if (top10Pct > config.screening.maxTop10Pct) {
     return `top10 concentration ${top10Pct}% above maximum ${config.screening.maxTop10Pct}%`;
   }
   if (Number.isFinite(botPct) && botPct > config.screening.maxBotHoldersPct) {

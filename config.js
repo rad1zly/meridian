@@ -98,6 +98,8 @@ export const config = {
     blockedLaunchpads:  u.blockedLaunchpads  ?? [],  // e.g. ["letsbonk.fun", "pump.fun"]
     minTokenAgeHours:   u.minTokenAgeHours   ?? null, // null = no minimum
     maxTokenAgeHours:   u.maxTokenAgeHours   ?? null, // null = no maximum
+    minDropFromAthPct:  u.minDropFromAthPct  ?? null, // e.g. -15 = deploy only if dropped 15% from ATH
+    ch1hHardFloorPct:   u.ch1hHardFloorPct   ?? -15, // hard-filter: skip if GMGN change_1h < -15%
   },
 
   // ─── Position Management ────────────────
@@ -115,6 +117,17 @@ export const config = {
     repeatDeployCooldownHours: u.repeatDeployCooldownHours ?? 12,
     repeatDeployCooldownScope: u.repeatDeployCooldownScope ?? "token", // pool | token | both
     repeatDeployCooldownMinFeeEarnedPct: u.repeatDeployCooldownMinFeeEarnedPct ?? u.repeatDeployCooldownMinFeeYieldPct ?? 0,
+    lossCooldownEnabled:      u.lossCooldownEnabled      ?? true,
+    lossCooldownHours:        u.lossCooldownHours        ?? 6,
+    lossCooldownHoursMild:    u.lossCooldownHoursMild    ?? 6,
+    lossCooldownPermanentOnSevere: u.lossCooldownPermanentOnSevere ?? true,
+    lossCooldownSeverityThresholdPct: u.lossCooldownSeverityThresholdPct ?? -20,
+    lossCooldownScope:        u.lossCooldownScope        ?? "token", // pool | token | both
+    lossCooldownMinLossPct:   u.lossCooldownMinLossPct   ?? 0,
+    winStreakCooldownEnabled: u.winStreakCooldownEnabled ?? true,
+    winStreakThreshold:       u.winStreakThreshold       ?? 3,
+    winStreakCooldownHours:   u.winStreakCooldownHours   ?? 24,
+    winStreakCooldownScope:   u.winStreakCooldownScope   ?? "token", // pool | token | both
     minVolumeToRebalance:  u.minVolumeToRebalance  ?? 1000,
     stopLossPct:           u.stopLossPct           ?? u.emergencyPriceDropPct ?? -50,
     takeProfitPct:         u.takeProfitPct         ?? u.takeProfitFeePct ?? 5,
@@ -129,6 +142,7 @@ export const config = {
     trailingTriggerPct:    u.trailingTriggerPct    ?? 3,    // activate trailing at X% PnL
     trailingDropPct:       u.trailingDropPct       ?? 1.5,  // close when drops X% from peak
     pnlSanityMaxDiffPct:   u.pnlSanityMaxDiffPct   ?? 5,    // max allowed diff between reported and derived pnl % before ignoring a tick
+    minHoldTimeMinutes:    u.minHoldTimeMinutes    ?? 2,    // ignore all exit rules (TP/SL/trailing/OOR/yield) for first N minutes after deploy — prevents spurious 7%-peak exits within seconds of open
     // SOL mode — positions, PnL, and balances reported in SOL instead of USD
     solMode:               u.solMode               ?? false,
   },

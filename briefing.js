@@ -28,6 +28,14 @@ export async function generateBriefing() {
 
   // 4. Current State
   const openPositions = allPositions.filter(p => !p.closed);
+  // Slot count: 1 hybrid pool = 1 slot (not 2 NFTs)
+  const slotKeys = new Set();
+  for (const p of openPositions) {
+    slotKeys.add(p.hybrid_group_id || `pool:${p.pool}`);
+  }
+  const slotCount = slotKeys.size;
+  const nftCount = openPositions.length;
+  const slotSuffix = nftCount !== slotCount ? ` (${nftCount} NFT${nftCount === 1 ? "" : "s"})` : "";
   const perfSummary = getPerformanceSummary();
 
   // 5. Format Message
@@ -51,7 +59,7 @@ export async function generateBriefing() {
       : "• No new lessons recorded overnight.",
     "",
     `<b>Current Portfolio:</b>`,
-    `📂 Open Positions: ${openPositions.length}`,
+    `📂 Open Positions: ${slotCount}${slotSuffix}`,
     perfSummary
       ? `📊 All-time PnL: $${perfSummary.total_pnl_usd.toFixed(2)} (${perfSummary.win_rate_pct}% win)`
       : "",

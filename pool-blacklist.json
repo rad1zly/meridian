@@ -1,0 +1,42 @@
+{
+  "51bq8gcfTcWJMYiuvnMh41RJY8sqW3czQQQPhsCDRM1o": {
+    "reason": "manual blocklist",
+    "added_at": "2026-06-17T00:00:00.000Z",
+    "added_by": "user"
+  },
+  "Aq45WcctBxwf5WcdFDinU3seZ6Q8bUqrUDEtdmZ9Nziw": {
+    "reason": "stop loss close (pnl -19.18%)",
+    "added_at": "2026-06-24T12:01:55.893Z",
+    "added_by": "agent"
+  },
+  "2YHZRtF4JBF3BzS5yho22zVFFehkVKeNeeyUtWXVJ7vx": {
+    "reason": "stop loss close (pnl -15.85%)",
+    "added_at": "2026-06-28T20:14:33.968Z",
+    "added_by": "agent"
+  },
+  "DP1qJaN8ZBn59t4AZpTfdCX7RwA24HE2sXpV1y2i7Tpn": {
+    "reason": "stop loss close (pnl -25.83%)",
+    "added_at": "2026-06-30T04:29:36.893Z",
+    "added_by": "agent"
+  },
+  "BGf9uMBGhB86WLbNXZVJN54pvoeTkWAw47X5iPATHLJ3": {
+    "reason": "manual blocklist (WIF2-SOL)",
+    "added_at": "2026-07-02T06:35:00.000Z",
+    "added_by": "user"
+  },
+  "3YnMGsdLPe2ffBJ7xwUsmukqhHi1sdRURkmPc8jRL7Xr": {
+    "reason": "manual blocklist (RUSH-SOL)",
+    "added_at": "2026-07-02T06:40:00.000Z",
+    "added_by": "user"
+  },
+  "gmtFt2Ap8jvwh7Jfa3dNeGBesjhsChkm6fnA4GNks6P": {
+    "reason": "manual blocklist (DR TRUMP-SOL)",
+    "added_at": "2026-07-02T07:00:00.000Z",
+    "added_by": "user"
+  },
+  "DWckvLy16sVGJv8rzZQbTa73vcDcR7dKJ9b92B2sMgof": {
+    "reason": "manual blocklist (LIQENG-SOL)",
+    "added_at": "2026-07-03T08:48:00.000Z",
+    "added_by": "user"
+  }
+}

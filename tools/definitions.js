@@ -125,26 +125,15 @@ Only call this if you need the current price to calculate a specific bin range (
     type: "function",
     function: {
       name: "deploy_position",
-      description: `Open a new DLMM liquidity position.
+      description: `⚠️ INTERNAL ONLY — DO NOT CALL THIS TOOL DIRECTLY (2026-07-03 hardcode).
 
-PRIORITY ORDER for strategy and bins:
-1. User explicitly specifies → always follow exactly (user override is absolute)
-2. No user spec → use the configured strategy from config.strategy.strategy and choose bins based on volatility
+This tool is reserved for internal use by deploy_hybrid_pool which dispatches spot + bid_ask sub-deploys atomically. Calling it directly from your tool selection will produce an ORPHAN single-side position with no hybrid pair — violating the 2026-07-03 hybrid hardcode.
 
-HARD RULES:
-- Never use 'curve'.
-- Bin Step: Only deploy in pools with bin_step between 80 and 125.
-- Volatility must be positive. If volatility is 0, null, or missing, do not deploy.
-- Range must cover at least 35 total bins. Never deploy 1-bin/tiny ranges.
-- For single-side SOL deploys (amount_y only, amount_x=0), do not request upside exposure:
-  use bins_below only, keep bins_above=0, and the upper bin will be pinned to the current active bin.
+YOU MUST USE: deploy_hybrid_pool for ALL new pool opens. It deploys 2 NFTs atomically (30% spot + 70% bid_ask) and counts as 1 slot. Both NFTs close together.
 
-Guidelines (only when user hasn't specified):
-- Strategy: omit the strategy field — the system will use the configured default from config.strategy.strategy
-- Bins: choose from configured minBinsBelow/maxBinsBelow by positive volatility. The hard lower floor is 35 bins.
-- Deposit: single-sided SOL only: set amount_y/amount_sol, keep amount_x=0.
+This tool is intentionally NOT in your screener function list. If you somehow see it, ignore it.
 
-WARNING: This executes a real on-chain transaction. Check DRY_RUN mode.`,
+If the user explicitly requests a SINGLE position deploy (e.g. "deploy 0.5 SOL spot only"), then deploy_hybrid_pool still works — pass total SOL and the 30/70 ratio becomes the internal split.`,
       parameters: {
         type: "object",
         properties: {
@@ -193,6 +182,78 @@ WARNING: This executes a real on-chain transaction. Check DRY_RUN mode.`,
           fee_tvl_ratio: { type: "number", description: "fee/TVL ratio at deploy time" },
           organic_score: { type: "number", description: "Base token organic score at deploy time" },
           initial_value_usd: { type: "number", description: "Estimated USD value being deployed" }
+        },
+        required: ["pool_address"]
+      }
+    }
+  },
+
+  // ─── Hybrid Pool Deploy (2026-07-03 HARDCODED) ───────────────
+  // Single tool call deploys 2 NFTs in same pool: spot (30% SOL) + bid_ask (70% SOL).
+  // 1 pool = 1 slot regardless of NFT count. Both close together.
+  {
+    type: "function",
+    function: {
+      name: "deploy_hybrid_pool",
+      description: `Open a HYBRID pair of DLMM positions in a single pool (2026-07-03 HARDCODED — this is the default deploy tool).
+
+WHAT THIS DOES:
+- Deploys TWO position NFTs in the SAME pool as a single atomic action.
+- Position 1 (spot):    30% of total SOL, single-side SOL, even distribution across bins.
+- Position 2 (bid_ask): 70% of total SOL, single-side SOL, edge-weighted distribution.
+- Ratio configurable via user-config.strategy.hybridSpotRatio (default 0.3).
+- Total slots used: 1 pool = 1 slot (NOT 2 — pair shares a single slot toward maxPositions).
+
+HARD RULES:
+- Bin Step: Only deploy in pools with bin_step between 80 and 125.
+- Range must cover at least 35 total bins. Never deploy 1-bin/tiny ranges.
+- Single-side SOL only: do NOT set amount_x. Pass total SOL via amount_y/amount_sol.
+- Do NOT pass a 'strategy' field — hybrid is automatic. Tool dispatches spot + bid_ask internally.
+- Do NOT pass bins_above. Single-side SOL means upper bin = active bin.
+- If coverage_bins_below is null, the deploy will be rejected (Formula A fallback disabled).
+
+USE THIS INSTEAD OF deploy_position. deploy_position is a legacy single-position deploy.
+Use deploy_hybrid_pool for ALL new opens to maintain hybrid pairing semantics.
+
+WARNING: This executes TWO real on-chain transactions (spot + bid_ask). Check DRY_RUN mode.`,
+      parameters: {
+        type: "object",
+        properties: {
+          pool_address: {
+            type: "string",
+            description: "The DLMM pool address to LP in"
+          },
+          amount_y: {
+            type: "number",
+            description: "Total amount of quote token (SOL) to deploy across both positions. Will be split 30/70 (spot/bid_ask)."
+          },
+          amount_sol: {
+            type: "number",
+            description: "Alias for amount_y. Total SOL to deploy."
+          },
+          bins_below: {
+            type: "number",
+            description: "Coverage-derived bins below active bin (40-150 range). Used by BOTH spot and bid_ask NFTs."
+          },
+          downside_pct: {
+            type: "number",
+            description: "Optional downside range in percent. Converted to bins via Meteora SDK if provided."
+          },
+          spot_ratio: {
+            type: "number",
+            description: "Override hybridSpotRatio. Default 0.3 (30% spot / 70% bid_ask). Range 0.05-0.95."
+          },
+          pool_name: { type: "string", description: "Human-readable pool name for record-keeping" },
+          base_mint: { type: "string", description: "Base token mint address" },
+          bin_step: { type: "number", description: "Pool bin step (from discover_pools)" },
+          base_fee: { type: "number", description: "Pool base fee percentage (from discover_pools)" },
+          volatility: { type: "number", description: "Pool volatility at deploy time" },
+          fee_tvl_ratio: { type: "number", description: "fee/TVL ratio at deploy time" },
+          organic_score: { type: "number", description: "Base token organic score at deploy time" },
+          initial_value_usd: { type: "number", description: "Estimated USD value being deployed" },
+          entry_mcap: { type: "number", description: "Entry market cap at deploy time" },
+          entry_tvl: { type: "number", description: "Entry TVL at deploy time" },
+          entry_volume: { type: "number", description: "Entry 24h volume at deploy time" }
         },
         required: ["pool_address"]
       }

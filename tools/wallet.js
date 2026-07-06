@@ -70,14 +70,32 @@ export async function getWalletBalances() {
     return { wallet: walletAddress, sol: 0, sol_price: 0, sol_usd: 0, usdc: 0, tokens: [], total_usd: 0, error: "Helius API key missing" };
   }
 
-  try {
-    const url = `https://api.helius.xyz/v1/wallet/${walletAddress}/balances?api-key=${HELIUS_KEY}`;
-    const res = await fetch(url);
-    
-    if (!res.ok) {
+  let res;
+  let lastErr;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const url = `https://api.helius.xyz/v1/wallet/${walletAddress}/balances?api-key=${HELIUS_KEY}`;
+      res = await fetch(url);
+      if (res.ok) break;
+      if (res.status >= 500 && res.status < 600) {
+        lastErr = new Error(`Helius API error: ${res.status} ${res.statusText}`);
+        log("wallet_warn", `Helius 5xx, retry ${attempt + 1}/3: ${res.status}`);
+        await new Promise((r) => setTimeout(r, 1500 * (attempt + 1)));
+        continue;
+      }
       throw new Error(`Helius API error: ${res.status} ${res.statusText}`);
+    } catch (e) {
+      if (e.message.includes("Helius API error") && !e.message.includes("5xx")) throw e;
+      lastErr = e;
+      log("wallet_warn", `Helius fetch attempt ${attempt + 1}/3 failed: ${e.message}`);
+      await new Promise((r) => setTimeout(r, 1500 * (attempt + 1)));
     }
+  }
+  if (!res || !res.ok) {
+    throw lastErr || new Error("Helius API failed after retries");
+  }
 
+  try {
     const data = await res.json();
     const balances = data.balances || [];
 

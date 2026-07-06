@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500;600&display=swap" rel="stylesheet">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: transparent;
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    width: 440px;
+    padding: 8px;
+  }
+
+  .card {
+    background: #0d1117;
+    border-radius: 20px;
+    border: 1px solid #21262d;
+    overflow: hidden;
+    box-shadow: 0 12px 40px rgba(0,0,0,0.6), 0 0 0 1px rgba(255,255,255,0.03) inset;
+  }
+
+  /* Top stripe */
+  .stripe-green  { height: 3px; background: linear-gradient(90deg, #238636, #2ea043, #3fb950); }
+  .stripe-red    { height: 3px; background: linear-gradient(90deg, #b62324, #da3633, #ff7b72); }
+  .stripe-yellow { height: 3px; background: linear-gradient(90deg, #9e6a03, #d29922, #e3b341); }
+
+  /* Header */
+  .header {
+    padding: 20px 22px 16px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .pair-block { display: flex; align-items: center; gap: 10px; }
+
+  .pair-icon {
+    width: 36px;
+    height: 36px;
+    border-radius: 10px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 16px;
+    font-weight: 700;
+    flex-shrink: 0;
+  }
+  .icon-green  { background: rgba(63,185,80,0.15);  color: #3fb950; }
+  .icon-red    { background: rgba(255,77,79,0.15);   color: #ff7b72; }
+  .icon-yellow { background: rgba(245,197,24,0.15);  color: #e3b341; }
+
+  .pair-name {
+    font-size: 17px;
+    font-weight: 700;
+    color: #f0f6fc;
+    letter-spacing: 0.2px;
+  }
+
+  .badge {
+    font-size: 11px;
+    font-weight: 600;
+    padding: 5px 12px;
+    border-radius: 20px;
+    letter-spacing: 0.4px;
+    font-family: 'Inter', sans-serif;
+  }
+  .badge-green  { background: rgba(63,185,80,0.15);  color: #3fb950; }
+  .badge-red    { background: rgba(255,77,79,0.15);   color: #ff7b72; }
+  .badge-yellow { background: rgba(245,197,24,0.15);  color: #e3b341; }
+
+  /* Stats row */
+  .stats {
+    padding: 0 22px 18px;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+  }
+
+  .stat-box {
+    background: #161b22;
+    border: 1px solid #21262d;
+    border-radius: 12px;
+    padding: 14px 16px;
+  }
+
+  .stat-label {
+    font-size: 10px;
+    font-weight: 600;
+    color: #484f58;
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    margin-bottom: 6px;
+  }
+
+  .stat-value {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 20px;
+    font-weight: 600;
+    color: #f0f6fc;
+    line-height: 1;
+  }
+
+  .stat-sub {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: #6e7681;
+    margin-top: 4px;
+  }
+
+  .val-green  { color: #3fb950 !important; }
+  .val-red    { color: #ff7b72 !important; }
+  .val-yellow { color: #e3b341 !important; }
+  .val-blue   { color: #58a6ff !important; }
+
+  /* Divider */
+  .divider { height: 1px; background: #21262d; margin: 0 22px; }
+
+  /* Meta rows */
+  .meta { padding: 12px 22px 16px; display: flex; flex-direction: column; gap: 6px; }
+
+  .meta-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .meta-left { display: flex; align-items: center; gap: 8px; }
+  .meta-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: #30363d;
+    flex-shrink: 0;
+  }
+  .dot-green  { background: #3fb950; }
+  .dot-blue   { background: #58a6ff; }
+  .dot-gray   { background: #6e7681; }
+  .dot-yellow { background: #d29922; }
+
+  .meta-label {
+    font-size: 13px;
+    color: #8b949e;
+    font-weight: 500;
+  }
+
+  .meta-val {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    font-weight: 500;
+    color: #c9d1d9;
+  }
+
+  /* Footer */
+  .footer {
+    padding: 12px 22px 16px;
+    border-top: 1px solid #21262d;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .footer-brand {
+    font-size: 11px;
+    color: #484f58;
+    font-weight: 500;
+  }
+
+  .footer-tag {
+    font-size: 10px;
+    color: #30363d;
+    background: #161b22;
+    border: 1px solid #21262d;
+    border-radius: 6px;
+    padding: 3px 8px;
+    font-family: 'JetBrains Mono', monospace;
+    font-weight: 500;
+  }
+</style>
+</head>
+<body>
+<div class="card" id="card">
+  <!-- Stripe (set via JS) -->
+  <div class="stripe-GREEN" id="stripe"></div>
+
+  <!-- Header -->
+  <div class="header">
+    <div class="pair-block">
+      <div class="pair-icon icon-GREEN" id="icon">◉</div>
+      <div class="pair-name" id="pair-name">POKÉFIGHT-SOL</div>
+    </div>
+    <div class="badge badge-GREEN" id="badge">▲ CLOSED</div>
+  </div>
+
+  <!-- Stats grid -->
+  <div class="stats">
+    <div class="stat-box">
+      <div class="stat-label">Net PnL</div>
+      <div class="stat-value val-GREEN" id="pnl-val">+0.0133</div>
+      <div class="stat-sub" id="pnl-sub">+2.67%  ≈ $0.016</div>
+    </div>
+    <div class="stat-box">
+      <div class="stat-label">Fees Earned</div>
+      <div class="stat-value val-blue" id="fees-val">0.5028</div>
+      <div class="stat-sub" id="fees-sub">$0.503</div>
+    </div>
+  </div>
+
+  <!-- Divider -->
+  <div class="divider"></div>
+
+  <!-- Meta rows -->
+  <div class="meta">
+    <div class="meta-row">
+      <div class="meta-left">
+        <div class="meta-dot dot-gray" id="dot-hold"></div>
+        <div class="meta-label" id="lbl-hold">Hold Time</div>
+      </div>
+      <div class="meta-val" id="meta-hold">14m</div>
+    </div>
+    <div class="meta-row">
+      <div class="meta-left">
+        <div class="meta-dot dot-blue" id="dot-vol"></div>
+        <div class="meta-label">Volatility</div>
+      </div>
+      <div class="meta-val" id="meta-vol">9.59</div>
+    </div>
+    <div class="meta-row">
+      <div class="meta-left">
+        <div class="meta-dot dot-yellow" id="dot-exit"></div>
+        <div class="meta-label" id="lbl-exit">Exit Reason</div>
+      </div>
+      <div class="meta-val" id="meta-exit" style="font-family:Inter,sans-serif; font-size:11px; text-align:right; max-width:200px; color:#8b949e;">agent decision</div>
+    </div>
+    <div class="meta-row">
+      <div class="meta-left">
+        <div class="meta-dot dot-gray"></div>
+        <div class="meta-label">SOL Price</div>
+      </div>
+      <div class="meta-val" id="meta-sol">@ $240.50</div>
+    </div>
+  </div>
+
+  <!-- Footer -->
+  <div class="footer">
+    <div class="footer-brand">Meridian · Range-Bound Strategy</div>
+    <div class="footer-tag" id="footer-tag">14m HOLD</div>
+  </div>
+</div>
+
+<script>
+  function render(data) {
+    const pnl = parseFloat(data.pnl_sol || 0);
+    const pnlPct = parseFloat(data.pnl_pct || 0);
+    const pnlUsd = parseFloat(data.pnl_usd || 0);
+    const feesSol = parseFloat(data.fees_sol || 0);
+    const feesUsd = parseFloat(data.fees_usd || 0);
+    const held = parseInt(data.minutes_held || 0);
+    const vol = parseFloat(data.volatility || 0);
+    const solPrice = parseFloat(data.sol_price || 0);
+
+    let color = 'green';
+    let sym = '◉';
+    let tag = 'PROFIT';
+    if (pnl < 0) {
+      color = 'red'; sym = '◎'; tag = 'LOSS';
+    } else if (Math.abs(pnl) < 0.0001) {
+      color = 'yellow'; sym = '◇'; tag = 'BREAKEVEN';
+    }
+
+    const cls = color; // green, red, yellow
+
+    // Stripe
+    const stripe = document.getElementById('stripe');
+    stripe.className = 'stripe-' + cls;
+
+    // Icon
+    const icon = document.getElementById('icon');
+    icon.className = 'pair-icon icon-' + cls;
+    icon.textContent = sym;
+
+    // Badge
+    const badge = document.getElementById('badge');
+    badge.className = 'badge badge-' + cls;
+    const badgeSym = color === 'green' ? '▲' : color === 'red' ? '▼' : '◇';
+    badge.textContent = badgeSym + ' CLOSED';
+
+    // Pair name
+    document.getElementById('pair-name').textContent = data.pair || 'UNKNOWN';
+
+    // PnL box
+    const pnlVal = document.getElementById('pnl-val');
+    pnlVal.className = 'stat-value val-' + cls;
+    const sign = pnl >= 0 ? '+' : '';
+    pnlVal.textContent = sign + pnl.toFixed(4);
+    document.getElementById('pnl-sub').textContent =
+      (pnlPct >= 0 ? '+' : '') + pnlPct.toFixed(2) + '%  ≈ $' + pnlUsd.toFixed(3);
+
+    // Fees box
+    document.getElementById('fees-val').textContent = feesSol.toFixed(4);
+    document.getElementById('fees-sub').textContent = '$' + feesUsd.toFixed(3);
+
+    // Hold time
+    const h = Math.floor(held / 60);
+    const m = held % 60;
+    const holdStr = h > 0 ? h + 'h ' + m + 'm' : held + 'm';
+    document.getElementById('meta-hold').textContent = holdStr;
+    document.getElementById('dot-hold').className = 'meta-dot dot-' + cls;
+
+    // Volatility
+    document.getElementById('meta-vol').textContent = vol.toFixed(2);
+
+    // Exit reason
+    const reason = data.close_reason || '—';
+    const reasonStr = reason.length > 28 ? reason.substring(0, 25) + '…' : reason;
+    const exitEl = document.getElementById('meta-exit');
+    exitEl.textContent = reasonStr;
+    const dotExit = document.getElementById('dot-exit');
+    dotExit.className = 'meta-dot dot-' + (cls === 'green' ? 'green' : cls === 'red' ? 'red' : 'yellow');
+
+    // SOL price
+    document.getElementById('meta-sol').textContent = solPrice ? '@ $' + solPrice.toFixed(2) : '—';
+
+    // Footer tag
+    document.getElementById('footer-tag').textContent = holdStr + ' ' + tag;
+  }
+
+  // Auto-render if data injected via URL param
+  (function() {
+    const params = new URLSearchParams(window.location.search);
+    const d = params.get('d');
+    if (d) {
+      try { render(JSON.parse(d)); } catch(e) {}
+    }
+  })();
+</script>
+</body>
+</html>

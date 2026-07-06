@@ -268,13 +268,18 @@ export async function confirmIndicatorPreset({
 
   const successful = results.filter((entry) => entry.ok);
   if (successful.length === 0) {
+    // FAIL-CLOSED (2026-07-02): if all interval fetches fail (e.g., 502 / timeout),
+    // do NOT silently pass the pool through. Treating "no data" as "confirmed"
+    // caused WIF2-SOL deploy at 15:10 — indicators API was 502, filter bypassed,
+    // pool had bad price action and bot deployed anyway.
     return {
       enabled: true,
-      confirmed: true,
-      skipped: true,
+      confirmed: false,
+      skipped: false,
+      error: true,
       preset,
       side,
-      reason: "Indicator API unavailable; falling back to existing logic",
+      reason: `Indicator API unavailable on all intervals (${results.map((r) => r.reason).join("; ")}) — fail-closed`,
       intervals: results,
     };
   }

@@ -5,7 +5,7 @@ import { executeTool } from "./tools/executor.js";
 import { tools } from "./tools/definitions.js";
 
 const MANAGER_TOOLS  = new Set(["close_position", "claim_fees", "swap_token", "get_position_pnl", "get_my_positions", "get_wallet_balance"]);
-const SCREENER_TOOLS = new Set(["deploy_position", "get_active_bin", "get_top_candidates", "check_smart_wallets_on_pool", "get_token_holders", "get_token_narrative", "get_token_info", "search_pools", "get_pool_memory", "get_wallet_balance", "get_my_positions"]);
+const SCREENER_TOOLS = new Set(["deploy_hybrid_pool", "get_active_bin", "get_top_candidates", "check_smart_wallets_on_pool", "get_token_holders", "get_token_narrative", "get_token_info", "search_pools", "get_pool_memory", "get_wallet_balance", "get_my_positions"]);
 const GENERAL_INTENT_ONLY_TOOLS = new Set([
   "self_update",
   "update_config",
@@ -29,7 +29,7 @@ const GENERAL_INTENT_ONLY_TOOLS = new Set([
 // Intent → tool subsets for GENERAL role
 const INTENT_TOOLS = {
   decisions:   new Set(["get_recent_decisions"]),
-  deploy:      new Set(["deploy_position", "get_top_candidates", "get_active_bin", "get_pool_memory", "check_smart_wallets_on_pool", "get_token_holders", "get_token_narrative", "get_token_info", "search_pools", "get_wallet_balance", "get_my_positions", "add_pool_note"]),
+  deploy:      new Set(["deploy_hybrid_pool", "get_top_candidates", "get_active_bin", "get_pool_memory", "check_smart_wallets_on_pool", "get_token_holders", "get_token_narrative", "get_token_info", "search_pools", "get_wallet_balance", "get_my_positions", "add_pool_note"]),
   close:       new Set(["close_position", "get_my_positions", "get_position_pnl", "get_wallet_balance", "swap_token"]),
   claim:       new Set(["claim_fees", "get_my_positions", "get_position_pnl", "get_wallet_balance"]),
   swap:        new Set(["swap_token", "get_wallet_balance"]),
@@ -177,9 +177,9 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
 
   // Track write tools fired this session — prevent the model from calling the same
   // destructive tool twice (e.g. deploy twice, swap twice after auto-swap)
-  const ONCE_PER_SESSION = new Set(["deploy_position", "swap_token", "close_position"]);
+  const ONCE_PER_SESSION = new Set(["deploy_hybrid_pool", "deploy_position", "swap_token", "close_position"]);
   // These lock after first attempt regardless of success — retrying them is always wrong
-  const NO_RETRY_TOOLS = new Set(["deploy_position"]);
+  const NO_RETRY_TOOLS = new Set(["deploy_hybrid_pool", "deploy_position"]);
   const firedOnce = new Set();
   const mustUseRealTool = shouldRequireRealToolUse(goal, agentType, interactive);
   let sawToolCall = false;
@@ -195,9 +195,11 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
       const activeModel = model || DEFAULT_MODEL;
 
       // Retry up to 3 times on transient provider errors (502, 503, 529)
-      const FALLBACK_MODEL = "stepfun/step-3.5-flash:free";
+      const FALLBACK_MODEL     = process.env.LLM_FALLBACK_MODEL     || "stepfun/step-3.5-flash:free";
+      const FALLBACK_BASE_URL  = process.env.LLM_FALLBACK_BASE_URL || null;
       let response;
       let usedModel = activeModel;
+      let usedBaseUrl = null; // null = use default client baseURL
       // Force a tool call on step 0 for action intents — prevents the model from inventing deploy/close outcomes
       const ACTION_INTENTS = /\b(deploy|open|add liquidity|close|exit|withdraw|claim|swap|block|unblock)\b/i;
       let toolChoice = (step === 0 && (ACTION_INTENTS.test(goal) || mustUseRealTool)) ? "required" : "auto";
@@ -212,7 +214,13 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
             max_tokens: maxOutputTokens ?? config.llm.maxTokens,
           };
           if (!omitToolChoice) reqParams.tool_choice = toolChoice;
-          response = await client.chat.completions.create(reqParams);
+          // Route through fallback baseURL if primary is down
+          if (usedBaseUrl) {
+            const fallbackClient = new OpenAI({ baseURL: usedBaseUrl, apiKey: process.env.LLM_FALLBACK_API_KEY || process.env.LLM_API_KEY, timeout: 5 * 60 * 1000 });
+            response = await fallbackClient.chat.completions.create(reqParams);
+          } else {
+            response = await client.chat.completions.create(reqParams);
+          }
         } catch (error) {
           if (providerMode === "system" && isSystemRoleError(error)) {
             providerMode = "user_embedded";
@@ -241,7 +249,8 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
           const wait = (attempt + 1) * 5000;
           if (attempt === 1 && usedModel !== FALLBACK_MODEL) {
             usedModel = FALLBACK_MODEL;
-            log("agent", `Switching to fallback model ${FALLBACK_MODEL}`);
+            usedBaseUrl = FALLBACK_BASE_URL;
+            log("agent", `Switching to fallback model ${FALLBACK_MODEL} via ${FALLBACK_BASE_URL || "default"}`);
           } else {
             log("agent", `Provider error ${errCode}, retrying in ${wait / 1000}s (attempt ${attempt + 1}/3)`);
             await new Promise((r) => setTimeout(r, wait));
@@ -288,10 +297,19 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
           continue;
         }
         if (mustUseRealTool && !sawToolCall) {
+          // Detect legitimate "no deploy / skip" verdict from the LLM. Screening prompts allow
+          // either a tool-call deploy OR a text-only NO DEPLOY response — both are valid.
+          // Without this guard, the agent rejects good text-only skip verdicts 4x.
+          const verdictText = String(msg.content || "");
+          const isSkipVerdict = /\b(NO DEPLOY|no deploy|skip|none qualify|no candidates?\b|do not deploy|not worth|do not invest|won'?t deploy|refuse)\b/i.test(verdictText);
+          if (isSkipVerdict) {
+            log("agent", `Accepted text-only skip/no-deploy verdict (len=${verdictText.length})`);
+            return { content: msg.content, userMessage: goal };
+          }
           noToolRetryCount += 1;
           messages.pop();
-          log("agent", `Rejected no-tool final answer (${noToolRetryCount}/2) for tool-required request`);
-          if (noToolRetryCount >= 2) {
+          log("agent", `Rejected no-tool final answer (${noToolRetryCount}/4) for tool-required request`);
+          if (noToolRetryCount >= 4) {
             return {
               content: "I couldn't complete that reliably because no tool call was made. Please retry after checking the logs.",
               userMessage: goal,

@@ -73,6 +73,8 @@ export function trackPosition({
   entry_tvl = null,
   entry_volume = null,
   entry_holders = null,
+  hybrid_group_id = null,   // hybrid pool grouping: shared by spot + bid_ask NFTs in same pool
+  hybrid_role = null,        // "spot" | "bid_ask" | null (single deploy)
 }) {
   const state = load();
   state.positions[position] = {
@@ -96,6 +98,8 @@ export function trackPosition({
     entry_holders,
     signal_snapshot: signal_snapshot || null,
     deployed_at: new Date().toISOString(),
+    hybrid_group_id,
+    hybrid_role,
     out_of_range_since: null,
     last_claim_at: null,
     total_fees_claimed_usd: 0,
@@ -182,6 +186,44 @@ function pushEvent(state, event) {
 }
 
 /**
+ * Add to a tracked position's amount_sol (e.g. hybrid Phase 2 addLiquidity).
+ * role="hybrid_leg" appends a note for display/audit. Returns false if pos missing or closed.
+ */
+export function recordAddLiquidity(position_address, added_amount_sol, role = "add") {
+  const state = load();
+  const pos = state.positions[position_address];
+  if (!pos || pos.closed) return false;
+  const added = Number(added_amount_sol);
+  if (!Number.isFinite(added) || added <= 0) return false;
+  pos.amount_sol = (Number(pos.amount_sol) || 0) + added;
+  if (role === "hybrid_leg") {
+    pos.notes = pos.notes || [];
+    pos.notes.push(`Hybrid leg added: +${added.toFixed(4)} SOL at ${new Date().toISOString()}`);
+  }
+  save(state);
+  log("state", `Position ${position_address} +${added.toFixed(4)} SOL (${role}) → total ${pos.amount_sol.toFixed(4)} SOL`);
+  return true;
+}
+
+/**
+ * Downgrade a position from "hybrid" → "spot" and clear hybrid_breakdown.
+ * Used when hybrid Phase 2 fails — the spot leg is real on-chain but bid_ask leg is missing.
+ * Appends a note for audit. Returns false if pos missing or closed.
+ */
+export function downgradeHybridToSpot(position_address, reason) {
+  const state = load();
+  const pos = state.positions[position_address];
+  if (!pos || pos.closed) return false;
+  pos.strategy = "spot";
+  pos.hybrid_breakdown = null;
+  pos.notes = pos.notes || [];
+  pos.notes.push(`Downgraded hybrid→spot at ${new Date().toISOString()}: ${reason}`);
+  save(state);
+  log("state", `Position ${position_address} downgraded hybrid→spot: ${reason}`);
+  return true;
+}
+
+/**
  * Mark a position as closed.
  */
 export function recordClose(position_address, reason) {
@@ -207,6 +249,22 @@ export function setPositionInstruction(position_address, instruction) {
   pos.instruction = sanitizeStoredText(instruction);
   save(state);
   log("state", `Position ${position_address} instruction set: ${pos.instruction}`);
+  return true;
+}
+
+/**
+ * Overwrite the strategy field for a tracked position. Used by deployHybridPool to
+ * re-classify the position as "hybrid" after Phase 1 (which deployPosition auto-tracked
+ * as "spot"). Also stores allocation breakdown in a separate field for display.
+ */
+export function setPositionStrategy(position_address, strategy, hybridBreakdown = null) {
+  const state = load();
+  const pos = state.positions[position_address];
+  if (!pos) return false;
+  pos.strategy = strategy;
+  if (hybridBreakdown) pos.hybrid_breakdown = hybridBreakdown;
+  save(state);
+  log("state", `Position ${position_address} strategy → ${strategy}`);
   return true;
 }
 
@@ -310,6 +368,60 @@ export function getTrackedPositions(openOnly = false) {
 }
 
 /**
+ * Count open slot usage. Hybrid (2 NFTs in same pool) = 1 slot.
+ * Falls back to per-NFT count for legacy single positions.
+ */
+export function getOpenSlotCount() {
+  const state = load();
+  const slots = new Set();
+  for (const p of Object.values(state.positions)) {
+    if (p.closed) continue;
+    // Hybrid groups: 1 pool = 1 slot regardless of NFT count
+    // Use hybrid_group_id if present, otherwise pool address (single deploy)
+    const slotKey = p.hybrid_group_id || `pool:${p.pool}`;
+    slots.add(slotKey);
+  }
+  return slots.size;
+}
+
+/**
+ * Get all open pools (deduped). Used for slot-limit checks.
+ */
+export function getOpenPools() {
+  const state = load();
+  const pools = new Set();
+  for (const p of Object.values(state.positions)) {
+    if (!p.closed && p.pool) pools.add(p.pool);
+  }
+  return Array.from(pools);
+}
+
+/**
+ * Group open positions by hybrid group (or single pool if no hybrid_group_id).
+ * Returns array of groups, each with: key, pool, pool_name, deployed_at, legs[].
+ */
+export function getOpenPositionGroups() {
+  const state = load();
+  const groupsMap = new Map();
+  for (const p of Object.values(state.positions)) {
+    if (p.closed) continue;
+    const key = p.hybrid_group_id || `single:${p.position}`;
+    if (!groupsMap.has(key)) {
+      groupsMap.set(key, {
+        key,
+        pool: p.pool,
+        pool_name: p.pool_name,
+        deployed_at: p.deployed_at,
+        is_hybrid: !!p.hybrid_group_id,
+        legs: [],
+      });
+    }
+    groupsMap.get(key).legs.push(p);
+  }
+  return Array.from(groupsMap.values());
+}
+
+/**
  * Get a single tracked position.
  */
 export function getTrackedPosition(position_address) {
@@ -327,8 +439,16 @@ export function getStateSummary() {
   const totalFeesClaimed = Object.values(state.positions)
     .reduce((sum, p) => sum + (p.total_fees_claimed_usd || 0), 0);
 
+  // Group by hybrid_group_id (or per-NFT for legacy). 1 hybrid pool = 1 slot, not 2 NFTs.
+  const slotKeys = new Set();
+  for (const p of open) {
+    const slotKey = p.hybrid_group_id || `pool:${p.pool}`;
+    slotKeys.add(slotKey);
+  }
+
   return {
-    open_positions: open.length,
+    open_positions: slotKeys.size,                // pool-slots, NOT raw NFT count
+    open_nfts: open.length,                       // raw NFT count (for diagnostics)
     closed_positions: closed.length,
     total_fees_claimed_usd: Math.round(totalFeesClaimed * 100) / 100,
     positions: open.map((p) => ({
@@ -336,6 +456,8 @@ export function getStateSummary() {
       pool: p.pool,
       strategy: p.strategy,
       deployed_at: p.deployed_at,
+      hybrid_group_id: p.hybrid_group_id || null,
+      hybrid_role: p.hybrid_role || null,
       out_of_range_since: p.out_of_range_since,
       minutes_out_of_range: minutesOutOfRange(p.position),
       total_fees_claimed_usd: p.total_fees_claimed_usd,
@@ -362,6 +484,19 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
   const pos = state.positions[position_address];
   if (!pos || pos.closed) return null;
 
+  // Minimum hold time guard — block all exit-rule checks for the first N minutes
+  // after deploy. Prevents spurious exits (e.g. 7% peak within seconds of open due
+  // to a single noisy PnL tick arming trailing TP). Set to 0 to disable.
+  const minHoldMs = Math.max(0, Number(mgmtConfig?.minHoldTimeMinutes ?? 0)) * 60 * 1000;
+  if (minHoldMs > 0 && pos.deployed_at) {
+    const ageMs = Date.now() - new Date(pos.deployed_at).getTime();
+    if (ageMs < minHoldMs) {
+      // Suppress ALL exits during the hold window. Peak still updates elsewhere
+      // (confirmPeak in the fast poller / cron) — we just refuse to act on it.
+      return null;
+    }
+  }
+
   let changed = false;
 
   // Activate trailing TP once trigger threshold is reached
@@ -384,11 +519,11 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
 
   if (changed) save(state);
 
-  // ── Stop loss ──────────────────────────────────────────────────
-  if (!pnl_pct_suspicious && currentPnlPct != null && mgmtConfig.stopLossPct != null && currentPnlPct <= mgmtConfig.stopLossPct) {
+  // ── Stop loss (OOR-only) ────────────────────────────
+  if (!pnl_pct_suspicious && pos.out_of_range_since && currentPnlPct != null && mgmtConfig.stopLossPct != null && currentPnlPct <= mgmtConfig.stopLossPct) {
     return {
       action: "STOP_LOSS",
-      reason: `Stop loss: PnL ${currentPnlPct.toFixed(2)}% <= ${mgmtConfig.stopLossPct}%`,
+      reason: `Stop loss (OOR): PnL ${currentPnlPct.toFixed(2)}% <= ${mgmtConfig.stopLossPct}%`,
     };
   }
 
@@ -453,6 +588,47 @@ export function setLastBriefingDate() {
   const state = load();
   state._lastBriefingDate = new Date().toISOString().slice(0, 10); // YYYY-MM-DD UTC
   save(state);
+}
+
+/**
+ * Remove every tracked position that matches the given pool address.
+ * Used by the deploy retry path to scrub ghosts left behind by a previous
+ * failed attempt (e.g. InvalidBinArray 0x178b) before retrying with a
+ * smaller bin range. The next call to `trackPosition` for the same pool
+ * is guaranteed to land in a clean slot.
+ *
+ * @param {string} poolAddress - DLMM pool pubkey
+ * @param {object} [opts]
+ * @param {boolean} [opts.openOnly=true] - only remove still-open entries; pass false to nuke closed history too.
+ * @returns {string[]} addresses that were removed (for logging)
+ */
+export function deleteGhostPositionsForPool(poolAddress, { openOnly = true } = {}) {
+  if (!poolAddress) return [];
+  const state = load();
+  const removed = [];
+  for (const posId of Object.keys(state.positions || {})) {
+    const pos = state.positions[posId];
+    if (!pos) continue;
+    if (pos.pool !== poolAddress) continue;
+    if (openOnly && pos.closed) continue;
+    delete state.positions[posId];
+    removed.push(posId);
+  }
+  if (removed.length > 0) {
+    state._ghostCleanups = state._ghostCleanups || [];
+    state._ghostCleanups.push({
+      pool: poolAddress,
+      removed,
+      at: new Date().toISOString(),
+    });
+    // Keep the audit trail bounded — drop oldest if we ever exceed 50 entries.
+    if (state._ghostCleanups.length > 50) {
+      state._ghostCleanups = state._ghostCleanups.slice(-50);
+    }
+    save(state);
+    log("state", `Ghost cleanup for pool ${poolAddress.slice(0, 8)}: removed ${removed.length} entr${removed.length === 1 ? "y" : "ies"} [${removed.map((a) => a.slice(0, 8)).join(", ")}]`);
+  }
+  return removed;
 }
 
 /**

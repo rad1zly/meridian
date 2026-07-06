@@ -139,6 +139,8 @@ export async function recordPerformance(perf) {
     signal_snapshot: signalSnapshot,
     pnl_usd: Math.round(pnl_usd * 100) / 100,
     pnl_pct: Math.round(pnl_pct * 100) / 100,
+    pnl_sol: perf.pnl_sol != null ? Math.round(perf.pnl_sol * 10000) / 10000 : null,
+    pnl_sol_pct: perf.pnl_sol_pct != null ? Math.round(perf.pnl_sol_pct * 100) / 100 : null,
     range_efficiency: Math.round(range_efficiency * 10) / 10,
     recorded_at: new Date().toISOString(),
   };
@@ -167,6 +169,8 @@ export async function recordPerformance(perf) {
       closed_at: entry.recorded_at,
       pnl_pct: entry.pnl_pct,
       pnl_usd: entry.pnl_usd,
+      pnl_sol: entry.pnl_sol,
+      pnl_sol_pct: entry.pnl_sol_pct,
       range_efficiency: entry.range_efficiency,
       minutes_held: perf.minutes_held,
       fees_earned_usd: perf.fees_earned_usd,

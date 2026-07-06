@@ -486,6 +486,28 @@ const repeatDeployCooldownMinFeeEarnedPct = await askNum(
   { min: 0 }
 );
 
+const lossCooldownEnabled = await askBool(
+  "Cooldown pool/token after a loss close?",
+  p("lossCooldownEnabled", true)
+);
+
+const lossCooldownHours = await askNum(
+  "Loss cooldown hours",
+  p("lossCooldownHours", 6),
+  { min: 0 }
+);
+
+const lossCooldownScope = await ask(
+  "Loss cooldown scope (pool/token/both)",
+  p("lossCooldownScope", "token")
+);
+
+const lossCooldownMinLossPct = await askNum(
+  "Loss cooldown min loss % (e.g. 0 = any loss, -10 = only losses worse than -10%)",
+  p("lossCooldownMinLossPct", 0),
+  { min: -100 }
+);
+
 // ─── Section 6b: Trailing Take Profit ────────────────────────────────────────
 console.log("\n── Trailing Take Profit ──────────────────────────────────────");
 
@@ -696,6 +718,10 @@ const userConfig = {
   repeatDeployCooldownHours,
   repeatDeployCooldownScope,
   repeatDeployCooldownMinFeeEarnedPct,
+  lossCooldownEnabled,
+  lossCooldownHours,
+  lossCooldownScope,
+  lossCooldownMinLossPct,
   // Trailing TP
   trailingTakeProfit,
   trailingTriggerPct,

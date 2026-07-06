@@ -3,8 +3,21 @@ import { isBlacklisted } from "../token-blacklist.js";
 import { isDevBlocked, getBlockedDevs } from "../dev-blocklist.js";
 import { log } from "../logger.js";
 import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
+import { isPoolBlacklisted } from "../pool-blacklist.js";
 import { confirmIndicatorPreset } from "./chart-indicators.js";
 import { getAgentMeridianBase, getAgentMeridianHeaders } from "./agent-meridian.js";
+import { getGmgnTokenSnapshot, clearGmgnSnapshotCache, computeCoverageBins } from "./gmgn.js";
+
+// Cross-cycle cache of coverage-computed bins_below, keyed by pool_address.
+// Set during the coverage loop, read by executor.js deploy_position for
+// enforcement. Persistent across cycles (latest write wins per pool).
+const _computedBinsByPool = new Map();
+
+/** Get the coverage-computed bins_below for a pool (or undefined). */
+export function getComputedBinsBelow(poolAddress) {
+  if (!poolAddress) return undefined;
+  return _computedBinsByPool.get(poolAddress);
+}
 
 const DATAPI_JUP = "https://datapi.jup.ag/v1";
 
@@ -29,7 +42,7 @@ const PVP_MIN_HOLDERS = 500;
 const PVP_MIN_GLOBAL_FEES_SOL = 30;
 
 function normalizeSymbol(symbol) {
-  return String(symbol || "").trim().toUpperCase();
+  return String(symbol || "").trim().replace(/\s+/g, " ").toUpperCase();
 }
 
 export function scoreCandidate(pool) {
@@ -38,6 +51,47 @@ export function scoreCandidate(pool) {
   const volume = Number(pool.volume_window || 0);
   const holders = Number(pool.holders || 0);
   return feeTvl * 1000 + organic * 10 + volume / 100 + holders / 100;
+}
+
+/**
+ * Compute price-change % from Meteora's `price_trend` array at a given lookback in minutes.
+ * price_trend is a chronologically ordered array (oldest → newest) where each entry
+ * is one candle of `timeframeMinutes` width. Returns null if trend is too short or
+ * the target lookback doesn't have a corresponding candle.
+ */
+function computePriceChangeFromTrend(trend, currentPrice, timeframeKey, lookbackMinutes) {
+  if (!Array.isArray(trend) || trend.length < 2) return null;
+  const candleMinutes = TIMEFRAME_MINUTES[timeframeKey] || TIMEFRAME_MINUTES["30m"];
+  if (!candleMinutes || candleMinutes <= 0) return null;
+  const stepsBack = Math.round(lookbackMinutes / candleMinutes);
+  const idx = trend.length - 1 - stepsBack;
+  if (idx < 0) return null;
+  const past = Number(trend[idx]);
+  const now = Number(currentPrice ?? trend[trend.length - 1]);
+  if (!Number.isFinite(past) || !Number.isFinite(now) || past === 0) return null;
+  return fix(((now - past) / past) * 100, 1);
+}
+
+/**
+ * Strategy selection — hardcoded to SPOT ONLY by user direction (2026-06-30).
+ *
+ * Coverage formula (computeCoverageBins in tools/gmgn.js) handles range width
+ * autonomously using vol_adj + organic + direction. Spot captures fees BOTH
+ * directions (pump + dump) which is exactly what a coverage-based range wants.
+ *
+ * Why spot-only (supersedes earlier vol ≥ 6 → bid_ask hardcode):
+ * - 2 consecutive bid_ask losses (ALON vol=9.27 + WYNN vol=7.01)
+ * - Coverage = range width tool; naturally serves spot direction
+ * - Bid_ask concentrates downside at the cost of total upside capture
+ * - Cleaner attribution: variance from range width alone, not strategy choice
+ *
+ * If future bid_ask use cases emerge, restore via config flag (not hardcode).
+ *
+ * @param {Object} pool - Pool object with volatility field
+ * @returns {"spot"} always
+ */
+export function computeStrategySuggestion(pool) {
+  return "spot";
 }
 
 /**
@@ -151,6 +205,12 @@ function getRawPoolScreeningRejectReason(pool, s) {
   }
   if (pool?.base_token_has_critical_warnings === true) return "base token has critical warnings";
   if (pool?.quote_token_has_critical_warnings === true) return "quote token has critical warnings";
+  // Require SOL as quote token — single-side SOL deploys (amount_y = SOL) only work in SOL pools.
+  // USDC/USDT pools would fail at deploy simulation ("insufficient funds" since wallet holds 0 USDC).
+  const quoteSymbol = String(quote?.symbol || "").toUpperCase();
+  if (quoteSymbol !== "SOL" && quoteSymbol !== "WSOL") {
+    return `quote token ${quoteSymbol || "unknown"} is not SOL (single-side SOL deploys only)`;
+  }
   if (pool?.base_token_has_high_single_ownership === true) return "base token has high single ownership";
   if (pool?.pool_type && pool.pool_type !== "dlmm") return `pool_type ${pool.pool_type} is not dlmm`;
 
@@ -162,6 +222,14 @@ function getRawPoolScreeningRejectReason(pool, s) {
   if (s.maxTvl != null && tvl > s.maxTvl) return `TVL ${tvl} above maxTvl ${s.maxTvl}`;
   if (binStep == null || binStep < s.minBinStep) return `bin_step ${binStep ?? "unknown"} below minBinStep ${s.minBinStep}`;
   if (binStep > s.maxBinStep) return `bin_step ${binStep} above maxBinStep ${s.maxBinStep}`;
+  const poolPrice = numeric(pool?.pool_price);
+  const athPrice = numeric(pool?.max_price);
+  if (s.minDropFromAthPct != null && poolPrice != null && athPrice != null && athPrice > 0) {
+    const dropFromAthPct = ((poolPrice - athPrice) / athPrice) * 100;
+    if (dropFromAthPct > s.minDropFromAthPct) {
+      return `price drop from ATH ${dropFromAthPct.toFixed(1)}% above threshold ${s.minDropFromAthPct}%`;
+    }
+  }
   if (feeActiveTvlRatio == null || feeActiveTvlRatio < s.minFeeActiveTvlRatio) {
     return `fee/active-TVL ${feeActiveTvlRatio ?? "unknown"} below minFeeActiveTvlRatio ${s.minFeeActiveTvlRatio}`;
   }
@@ -360,13 +428,14 @@ async function enrichPvpRisk(pools) {
   const symbolCache = new Map();
 
   await Promise.all(shortlist.map(async (pool) => {
+    const rawSymbol = String(pool.base?.symbol || "").trim();
     const symbol = normalizeSymbol(pool.base?.symbol);
     const ownMint = pool.base?.mint;
-    if (!symbol || !ownMint) return;
+    if (!rawSymbol || !ownMint) return;
 
     let assets = symbolCache.get(symbol);
     if (!assets) {
-      assets = await searchAssetsBySymbol(symbol).catch(() => []);
+      assets = await searchAssetsBySymbol(rawSymbol).catch(() => []);
       symbolCache.set(symbol, assets);
     }
 
@@ -532,7 +601,7 @@ export async function discoverPools({
 
   const condensed = thresholdedRawPools.map(condensePool);
 
-  // Hard-filter blacklisted tokens and blocked deployers (what pool discovery already gave us)
+  // Hard-filter blacklisted tokens, blocked deployers, and blocklisted pools
   let pools = condensed.filter((p) => {
     if (isBlacklisted(p.base?.mint)) {
       log("blacklist", `Filtered blacklisted token ${p.base?.symbol} (${p.base?.mint?.slice(0, 8)}) in pool ${p.name}`);
@@ -540,6 +609,10 @@ export async function discoverPools({
     }
     if (p.dev && isDevBlocked(p.dev)) {
       log("dev_blocklist", `Filtered blocked deployer ${p.dev?.slice(0, 8)} token ${p.base?.symbol} in pool ${p.name}`);
+      return false;
+    }
+    if (isPoolBlacklisted(p.pool)) {
+      log("pool_blacklist", `Filtered blocklisted pool ${p.name} (${p.pool?.slice(0, 8)})`);
       return false;
     }
     return true;
@@ -650,6 +723,76 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     .sort((a, b) => scoreCandidate(b) - scoreCandidate(a))
     .slice(0, limit);
 
+  // Coverage-based bins_below via GMGN /v1/token/info (per-cycle cache).
+  // HARDCODED 2026-06-28: coverage is the PRIMARY bins source. User explicitly disabled
+  // Formula A as the default. Snapshot cached for the cycle so re-deploys to same
+  // base_mint in the same screening run don't double-fetch. If snapshot missing
+  // (rate-limit / API error / token <2h old / hasGmgnApiKey()=false),
+  // pool.computed_bins_below stays null — LLM then sees null and either falls back to
+  // Formula A (acceptable as last resort) or skips the candidate.
+  clearGmgnSnapshotCache();
+  await Promise.allSettled(
+    eligible.map(async (p) => {
+      const mint = p.base?.mint;
+      if (!mint) return;
+      try {
+        const snapshot = await getGmgnTokenSnapshot(mint);
+        if (!snapshot) return;
+        const binStep = Number(p.bin_step);
+        const coverageBins = computeCoverageBins({
+          snapshot,
+          organic: p.organic_score ?? 0,
+          binStep,
+          volatility: p.volatility,
+        });
+        if (Number.isFinite(coverageBins)) {
+          p.computed_bins_below = coverageBins;
+          _computedBinsByPool.set(p.pool, coverageBins);
+          log(
+            "screening",
+            `Coverage for ${p.name} (${p.pool?.slice(0, 8)}): bins_below=${coverageBins} (binStep=${binStep}, organic=${p.organic_score})`
+          );
+        }
+      } catch (e) {
+        log("screening", `Coverage lookup failed for ${p.name}: ${e.message}`);
+      }
+    })
+  );
+
+  // ch1h hard floor (2026-07-02): backup filter that runs even if indicator check fails.
+  // If GMGN snapshot says 1h is dumping hard (< ch1hHardFloorPct), reject the candidate
+  // regardless of indicator status. Catches WIF2-SOL-style "API down + bad price action".
+  // If GMGN snapshot is missing, allow through (don't punish missing data).
+  if (eligible.length > 0) {
+    const ch1hFloor = config.screening.ch1hHardFloorPct;
+    if (Number.isFinite(ch1hFloor)) {
+      const before = eligible.length;
+      const kept = [];
+      for (const p of eligible) {
+        const mint = p.base?.mint;
+        if (!mint) { kept.push(p); continue; }
+        const snap = getGmgnTokenSnapshot(mint); // already cached from coverage loop above
+        if (!snap) { kept.push(p); continue; } // no data, don't punish
+        const priceNow = Number(snap.price);
+        const price1h = Number(snap.price_1h);
+        if (!Number.isFinite(priceNow) || !Number.isFinite(price1h) || price1h <= 0) {
+          kept.push(p); continue;
+        }
+        const ch1h = ((priceNow - price1h) / price1h) * 100;
+        if (ch1h < ch1hFloor) {
+          pushFilteredReason(filteredOut, p, `ch1h ${ch1h.toFixed(2)}% below hard floor ${ch1hFloor}%`);
+          log("screening", `ch1h hard floor filtered ${p.name} (${p.pool?.slice(0, 8)}): ${ch1h.toFixed(2)}% < ${ch1hFloor}%`);
+          continue;
+        }
+        kept.push(p);
+      }
+      eligible.splice(0, eligible.length, ...kept);
+      if (eligible.length < before) {
+        log("screening", `ch1h hard floor removed ${before - eligible.length} candidate(s) (floor ${ch1hFloor}%)`);
+      }
+    }
+  }
+
   if (config.screening.avoidPvpSymbols && eligible.length > 0) {
     await enrichPvpRisk(eligible);
     if (config.screening.blockPvpSymbols) {
@@ -692,9 +835,10 @@ export async function getTopCandidates({ limit = 10 } = {}) {
             pool: pool.pool,
             confirmation: {
               enabled: true,
-              confirmed: true,
-              skipped: true,
-              reason: `Indicator confirmation unavailable: ${error.message}`,
+              confirmed: false,
+              skipped: false,
+              error: true,
+              reason: `Indicator confirmation unavailable: ${error.message} — fail-closed`,
               intervals: [],
             },
           };
@@ -715,6 +859,14 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     if (eligible.length < before) {
       log("screening", `Indicator confirmation removed ${before - eligible.length} candidate(s)`);
     }
+  }
+
+  // Compute directional strategy suggestion for each surviving candidate.
+  // POV from above: single-side SOL, bins_below only — bid_ask only useful when price
+  // is expected to sweep DOWN into our range from above. See computeStrategySuggestion().
+  for (const pool of eligible) {
+    const suggested = computeStrategySuggestion(pool);
+    pool.suggested_strategy = suggested;
   }
 
   return {
@@ -801,6 +953,8 @@ function condensePool(p) {
     price: p.pool_price,
     price_change_pct: fix(p.pool_price_change_pct, 1),
     price_trend: p.price_trend,
+    pc_30m: computePriceChangeFromTrend(p.price_trend, p.pool_price, config.screening.timeframe, 30),
+    pc_15m: computePriceChangeFromTrend(p.price_trend, p.pool_price, config.screening.timeframe, 15),
     min_price: p.min_price,
     max_price: p.max_price,
 
@@ -815,6 +969,9 @@ function condensePool(p) {
     unique_lps: p.unique_lps,
     unique_lps_change_pct: fix(p.unique_lps_change_pct, 1),
     positions_created: p.positions_created,
+
+    // Strategy suggestion from multi-signal directional score (see computeStrategySuggestion)
+    suggested_strategy: p.suggested_strategy ?? null,
   };
 }
 
